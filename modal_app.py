@@ -28,7 +28,7 @@ app = modal.App("email-classifier", image=image)
 
 @app.cls(
     cpu=2,                      
-    memory=1024,                  
+    memory=2048,                  
     secrets=[modal.Secret.from_name("email-classifier-secrets")],
     timeout=300,
     scaledown_window=300,         
