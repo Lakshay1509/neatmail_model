@@ -1,9 +1,7 @@
 import modal
 
-
 image = (
     modal.Image.debian_slim(python_version="3.11")
-   
     .pip_install(
         "torch",
         extra_options="--index-url https://download.pytorch.org/whl/cpu",
@@ -14,10 +12,8 @@ image = (
         "pinecone",
         "openai",
         "uvicorn",
-        "python-dotenv",  
-        "dotenv"
+        "python-dotenv",
     ])
-    
     .run_commands(
         "python -c \""
         "from sentence_transformers import SentenceTransformer; "
@@ -30,18 +26,44 @@ image = (
 app = modal.App("email-classifier", image=image)
 
 
-# ---------------------------------------------------------------------------
-# Function config
-# ---------------------------------------------------------------------------
-@app.function(
-    cpu=1,               
-    memory=1536,         
+@app.cls(
+    cpu=2,                      
+    memory=2048,                  
     secrets=[modal.Secret.from_name("email-classifier-secrets")],
     timeout=300,
-    scaledown_window=60, 
+    scaledown_window=300,         
+    enable_memory_snapshot=True,
+    min_containers=0,             
 )
 @modal.concurrent(max_inputs=10)
-@modal.asgi_app()
-def fastapi_app():
-    from main import app
-    return app
+class EmailClassifier:
+
+    @modal.enter(snap=True)
+    def load_model(self):
+        from sentence_transformers import SentenceTransformer
+        print("Loading embedding model...")
+        self.embedding_model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
+        self.embedding_model.encode("warmup", normalize_embeddings=True)
+        print("Model ready.")
+
+    @modal.enter(snap=False)
+    def init_clients(self):
+        import os
+        from pinecone import Pinecone
+        from openai import OpenAI
+        print("Connecting to Pinecone & OpenAI...")
+        self.pinecone_index = Pinecone(
+            api_key=os.environ["PINECONE_API_KEY"]
+        ).Index(os.environ["PINECONE_INDEX_NAME"])
+        self.openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        print("Clients ready.")
+
+    @modal.asgi_app()
+    def fastapi_app(self):
+        from main import app as fastapi_app
+
+        fastapi_app.state.embedding_model = self.embedding_model
+        fastapi_app.state.pinecone_index = self.pinecone_index
+        fastapi_app.state.openai_client = self.openai_client
+
+        return fastapi_app

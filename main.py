@@ -11,7 +11,9 @@ Label storage — single namespace, two tiers via metadata:
                      for different users. Managed via POST /user/label.
 
 Classification queries both tiers separately and merges scores (max per label).
-Feedback loop always writes with scope="user" — never touches system vectors.
+Feedback loop scope mirrors the label tier:
+  • System label → learned example stored as scope="system" (improves globally for all users)
+  • User label   → learned example stored as scope="user" (stays private to that user)
 """
 
 import os
@@ -23,48 +25,45 @@ from typing import Optional
 from contextlib import asynccontextmanager
 import uvicorn
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from pinecone import Pinecone
-from sentence_transformers import SentenceTransformer
-from openai import OpenAI
 
-
-load_dotenv()
+# Only load .env locally, not on Modal
+import os
+if not os.environ.get("MODAL_ENVIRONMENT"):
+    from dotenv import load_dotenv
+    load_dotenv()
 
 
 # ─────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────
 
-PINECONE_API_KEY   = os.environ["PINECONE_API_KEY"]
-PINECONE_INDEX     = os.environ["PINECONE_INDEX_NAME"]   # dim=1024, metric=cosine
-OPENAI_API_KEY     = os.environ["OPENAI_API_KEY"]
+PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
+PINECONE_INDEX = os.environ["PINECONE_INDEX_NAME"]   # dim=1024, metric=cosine
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-GLOBAL_NAMESPACE       = "labels"   
-PROTOTYPES_PER_LABEL   = 5          
+GLOBAL_NAMESPACE = "labels"
+PROTOTYPES_PER_LABEL = 5
 
 
 SCOPE_SYSTEM = "system"
-SCOPE_USER   = "user"
+SCOPE_USER = "user"
 
 # Confidence thresholds
-HIGH_CONFIDENCE_MARGIN = 0.08
-LOW_CONFIDENCE_MARGIN  = 0.03
-LOW_ABSOLUTE_SCORE     = 0.35
+HIGH_CONFIDENCE_MARGIN   = 0.20   # only trust embedding if VERY decisive
+LOW_CONFIDENCE_MARGIN    = 0.08   # send to LLM much more aggressively
+LOW_ABSOLUTE_SCORE       = 0.50   # top score must be strong to trust
 
-TOP_K = 100   
-SIMILARITY_THRESHOLD     = 0.92  
-LLM_CONFIDENCE_THRESHOLD = 0.85  
+TOP_K                    = 100    # unchanged
+SIMILARITY_THRESHOLD     = 0.85   # store more examples (less strict dedup)
+LLM_CONFIDENCE_THRESHOLD = 0.80   # accept slightly less confident LLM results
 
 QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belongs to.\nQuery: "
 
 
-
-
 embedding_model: SentenceTransformer = None
-pinecone_index  = None
+pinecone_index = None
 openai_client: OpenAI = None
 
 
@@ -72,17 +71,28 @@ openai_client: OpenAI = None
 async def lifespan(app: FastAPI):
     global embedding_model, pinecone_index, openai_client
 
-    print("Loading Qwen3 embedding model...")
-    embedding_model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
+    if hasattr(app.state, "embedding_model"):
+        # ── Running on Modal ──────────────────────────────────────────
+        # Models already loaded by @enter() before this runs.
+        # Just read from app.state — no blocking work here.
+        embedding_model = app.state.embedding_model
+        pinecone_index = app.state.pinecone_index
+        openai_client = app.state.openai_client
+        print("✅ Clients ready (restored from Modal snapshot).")
+    else:
+        # ── Local development fallback ────────────────────────────────
+        print("Loading Qwen3 embedding model...")
+        embedding_model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
 
-    print("Connecting to Pinecone...")
-    pc = Pinecone(api_key=PINECONE_API_KEY)
-    pinecone_index = pc.Index(PINECONE_INDEX)
+        print("Connecting to Pinecone...")
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        pinecone_index = pc.Index(PINECONE_INDEX)
 
-    print("Connecting to OpenAI...")
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        print("Connecting to OpenAI...")
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-    print("✅ All clients ready.")
+        print("✅ All clients ready.")
+
     yield
 
 
@@ -93,37 +103,41 @@ app = FastAPI(
 )
 
 
-
 class AddSystemLabelRequest(BaseModel):
     label_name: str
     description: Optional[str] = None
 
+
 class AddUserLabelRequest(BaseModel):
     user_id: str
     label_name: str
-    description: Optional[str] = None      # shapes prototypes to match THIS user's meaning
+    # shapes prototypes to match THIS user's meaning
+    description: Optional[str] = None
+
 
 class DeleteSystemLabelRequest(BaseModel):
     label_name: str
+
 
 class DeleteUserLabelRequest(BaseModel):
     user_id: str
     label_name: str
 
+
 class ClassifyRequest(BaseModel):
-    user_id: str                           
+    user_id: str
     subject: str
     sender: str
     body: str
-    labels: list[str]                       
+    labels: list[str]
+
 
 class ClassifyResponse(BaseModel):
     label: str
     confidence: float
     margin: float
-    method: str                            
+    method: str
     all_scores: dict[str, float]
-
 
 
 def embed_document(text: str) -> list[float]:
@@ -144,8 +158,6 @@ def embed_query(text: str) -> list[float]:
         normalize_embeddings=True,
         convert_to_tensor=False
     ).tolist()
-
-
 
 
 def generate_prototypes(label_name: str, description: Optional[str]) -> list[str]:
@@ -198,8 +210,19 @@ def llm_classify(subject: str, sender: str, body: str, label_names: list[str]) -
     labels_str = "\n".join(f"- {name}" for name in label_names)
 
     prompt = f"""
-Classify the following email into exactly one of these categories:
+You are an email classification system.
+ALLOWED CATEGORIES (case-sensitive, exact match required):
 {labels_str}
+
+CLASSIFICATION RULES (apply in order, highest priority first):
+1. FINANCE/PAYMENT: If email contains transactions, payments, UPI, bank alerts, invoices, money (₹/$) → use "Finance" if available, else use "Automated alerts" as fallback
+2. DOMAIN-SPECIFIC: Match sender domain to category (bank → Finance/Automated alerts, calendar → Event update)
+3. SEMANTIC CONTEXT: Analyze PURPOSE, not keywords
+   - Financial transactions → Finance (or Automated alerts if Finance unavailable)
+   - Calendar invites → Event update
+   - Marketing → Marketing
+4. KEYWORD MATCHING: Use for unclear cases
+
 
 Email:
 Subject: {subject}
@@ -221,7 +244,7 @@ Format: {{"label": "Marketing", "confidence": 0.95}}
     )
 
     parsed = json.loads(response.choices[0].message.content)
-    predicted   = parsed.get("label", "").strip()
+    predicted = parsed.get("label", "").strip()
     llm_confidence = float(parsed.get("confidence", 0.0))
 
     # Match back to known label names (handles extra punctuation from LLM)
@@ -282,52 +305,63 @@ def store_learned_example(
     body: str,
     label: str,
     query_vector: list[float],
-    user_id: str,                           # always scoped to the specific user
+    user_id: str,
+    scope: str = SCOPE_USER,
 ):
     """
     Store an LLM-confirmed email as a learned vector in Pinecone.
-    Always stored with scope="user" + user_id — NEVER modifies system vectors.
+
+    - scope="user"  : stored under this user only (custom labels)
+    - scope="system": stored globally, improves classification for all users (system labels)
+
     Only called when:
     - LLM confidence >= LLM_CONFIDENCE_THRESHOLD
-    - No near-identical vector already exists for this user+label
+    - No near-identical vector already exists for the target scope+label
     """
-    user_filter = {"scope": {"$eq": SCOPE_USER}, "user_id": {"$eq": user_id}}
+    if scope == SCOPE_SYSTEM:
+        dedup_filter = {"scope": {"$ne": SCOPE_USER}}
+        vector_id = f"{label}_sys_learned_{uuid.uuid4().hex[:8]}"
+        scope_tag = "system"
+    else:
+        dedup_filter = {"scope": {"$eq": SCOPE_USER},
+                        "user_id": {"$eq": user_id}}
+        vector_id = f"{label}_user_{user_id}_{uuid.uuid4().hex[:8]}"
+        scope_tag = f"user={user_id}"
 
-    if is_already_covered(query_vector, label, user_filter):
-        print(f"⏭️  Skipping storage — pattern already covered for '{label}' (user={user_id})")
+    if is_already_covered(query_vector, label, dedup_filter):
+        print(
+            f"⏭️  Skipping storage — pattern already covered for '{label}' ({scope_tag})")
         return
 
-    
     cleaned_text = clean_email_for_storage(subject, sender, body)
 
-    
     email_hash = hashlib.md5(
         f"{subject}{sender}{body[:200]}".encode()
     ).hexdigest()
 
-    vector_id = f"{label}_user_{user_id}_{uuid.uuid4().hex[:8]}"
+    metadata = {
+        "label":      label,
+        "prototype":  cleaned_text,
+        "scope":      scope,
+        "source":     "llm_fallback",
+        "email_hash": email_hash,
+        "llm_model":  "gpt-4o-mini",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    if scope == SCOPE_USER:
+        # user_id only on user-scoped vectors
+        metadata["user_id"] = user_id
 
     pinecone_index.upsert(
         vectors=[{
-            "id": vector_id,
+            "id":     vector_id,
             "values": embed_document(cleaned_text),
-            "metadata": {
-                "label":      label,
-                "prototype":  cleaned_text,
-                "scope":      SCOPE_USER,               # ← never "system"
-                "user_id":    user_id,
-                "source":     "llm_fallback",
-                "email_hash": email_hash,
-                "llm_model":  "gpt-4o-mini",
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }
+            "metadata": metadata
         }],
         namespace=GLOBAL_NAMESPACE
     )
 
-    print(f"✅ Learned new example for '{label}' → {vector_id} (user={user_id})")
-
-
+    print(f"✅ Learned new example for '{label}' → {vector_id} ({scope_tag})")
 
 
 @app.post("/system/label", summary="[Admin] Add a system label (shared by all users)")
@@ -357,7 +391,8 @@ async def add_system_label(request: AddSystemLabelRequest):
     try:
         prototypes = generate_prototypes(label_name, request.description)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prototype generation failed: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Prototype generation failed: {str(e)}")
 
     vectors = []
     for i, prototype_text in enumerate(prototypes):
@@ -425,7 +460,7 @@ async def add_user_label(request: AddUserLabelRequest):
     The description shapes prototypes to match what THIS user means by the label,
     so "Finance" can mean personal budgeting for one user and investor relations for another.
     """
-    user_id    = request.user_id.strip()
+    user_id = request.user_id.strip()
     label_name = request.label_name.strip()
     validation_vector = [0.01 if i % 3 == 0 else 0.0 for i in range(1024)]
 
@@ -433,7 +468,8 @@ async def add_user_label(request: AddUserLabelRequest):
         vector=validation_vector,
         top_k=1,
         namespace=GLOBAL_NAMESPACE,
-        filter={"label": {"$eq": label_name}, "scope": {"$eq": SCOPE_USER}, "user_id": {"$eq": user_id}},
+        filter={"label": {"$eq": label_name}, "scope": {
+            "$eq": SCOPE_USER}, "user_id": {"$eq": user_id}},
         include_metadata=False
     )
     if existing.matches:
@@ -445,7 +481,8 @@ async def add_user_label(request: AddUserLabelRequest):
     try:
         prototypes = generate_prototypes(label_name, request.description)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prototype generation failed: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Prototype generation failed: {str(e)}")
 
     vectors = []
     for i, prototype_text in enumerate(prototypes):
@@ -479,7 +516,7 @@ async def delete_user_label(request: DeleteUserLabelRequest):
     Deletes only this user's vectors for the label.
     System labels of the same name are completely unaffected.
     """
-    user_id    = request.user_id.strip()
+    user_id = request.user_id.strip()
     label_name = request.label_name.strip()
     validation_vector = [0.01 if i % 3 == 0 else 0.0 for i in range(1024)]
 
@@ -487,7 +524,8 @@ async def delete_user_label(request: DeleteUserLabelRequest):
         vector=validation_vector,
         top_k=TOP_K,
         namespace=GLOBAL_NAMESPACE,
-        filter={"label": {"$eq": label_name}, "scope": {"$eq": SCOPE_USER}, "user_id": {"$eq": user_id}},
+        filter={"label": {"$eq": label_name}, "scope": {
+            "$eq": SCOPE_USER}, "user_id": {"$eq": user_id}},
         include_metadata=False
     )
 
@@ -521,12 +559,15 @@ async def classify_email(request: ClassifyRequest):
     Scores from both tiers are merged (max per label), then confidence routing decides
     whether to use embedding result or fall back to GPT-4o-mini.
 
-    Feedback loop stores learned examples with scope="user" only — system vectors are never modified.
+    Feedback loop scope follows the label tier:
+      - System label → stored as scope="system" so ALL users benefit from the learned example.
+      - User label   → stored as scope="user" + user_id, stays private to this user.
     """
     if not request.labels:
-        raise HTTPException(status_code=400, detail="labels array cannot be empty.")
+        raise HTTPException(
+            status_code=400, detail="labels array cannot be empty.")
 
-    user_id     = request.user_id.strip()
+    user_id = request.user_id.strip()
     label_names = [l.strip() for l in request.labels]
     validation_vector = [0.01 if i % 3 == 0 else 0.0 for i in range(1024)]
 
@@ -541,7 +582,8 @@ async def classify_email(request: ClassifyRequest):
 
         in_user = pinecone_index.query(
             vector=validation_vector, top_k=1, namespace=GLOBAL_NAMESPACE,
-            filter={"label": {"$eq": label}, "scope": {"$eq": SCOPE_USER}, "user_id": {"$eq": user_id}},
+            filter={"label": {"$eq": label}, "scope": {
+                "$eq": SCOPE_USER}, "user_id": {"$eq": user_id}},
             include_metadata=False
         ).matches
 
@@ -585,15 +627,18 @@ async def classify_email(request: ClassifyRequest):
     query_and_merge({"scope": {"$ne": SCOPE_USER}})
 
     # User tier — only this user's custom vectors
-    query_and_merge({"scope": {"$eq": SCOPE_USER}, "user_id": {"$eq": user_id}})
+    query_and_merge({"scope": {"$eq": SCOPE_USER},
+                    "user_id": {"$eq": user_id}})
 
     # ── Step 4: Rank and check confidence ────────────────────────
-    sorted_labels = sorted(label_scores.items(), key=lambda x: x[1], reverse=True)
+    sorted_labels = sorted(label_scores.items(),
+                           key=lambda x: x[1], reverse=True)
     top_label, top_score = sorted_labels[0]
-    second_score         = sorted_labels[1][1] if len(sorted_labels) > 1 else 0.0
-    margin               = top_score - second_score
+    second_score = sorted_labels[1][1] if len(sorted_labels) > 1 else 0.0
+    margin = top_score - second_score
 
-    use_llm = (margin < LOW_CONFIDENCE_MARGIN) or (top_score < LOW_ABSOLUTE_SCORE)
+    use_llm = (margin < LOW_CONFIDENCE_MARGIN) or (
+        top_score < LOW_ABSOLUTE_SCORE)
 
     # ── Step 5: LLM fallback if needed ───────────────────────────
     if use_llm:
@@ -604,18 +649,32 @@ async def classify_email(request: ClassifyRequest):
             label_names=label_names          # only THIS user's requested labels, not all labels
         )
 
-        # Feedback loop — always stored under user scope, never bleeds across users
+        # Feedback loop — scope depends on whether the label is system or user-custom.
+        # System labels (e.g. "action needed") improve globally; user labels stay private.
         if llm_confidence >= LLM_CONFIDENCE_THRESHOLD:
+            is_system_label = pinecone_index.query(
+                vector=query_vector,
+                top_k=1,
+                namespace=GLOBAL_NAMESPACE,
+                filter={"label": {"$eq": llm_label},
+                        "scope": {"$ne": SCOPE_USER}},
+                include_metadata=False
+            ).matches
+
+            feedback_scope = SCOPE_SYSTEM if is_system_label else SCOPE_USER
+
             store_learned_example(
                 subject=request.subject,
                 sender=request.sender,
                 body=request.body,
                 label=llm_label,
                 query_vector=query_vector,
-                user_id=user_id
+                user_id=user_id,
+                scope=feedback_scope
             )
         else:
-            print(f"⚠️  LLM confidence too low ({llm_confidence:.2f}) — skipping storage")
+            print(
+                f"⚠️  LLM confidence too low ({llm_confidence:.2f}) — skipping storage")
 
         return ClassifyResponse(
             label=llm_label,
@@ -632,8 +691,6 @@ async def classify_email(request: ClassifyRequest):
         method="embedding",
         all_scores={k: round(v, 4) for k, v in label_scores.items()}
     )
-
-
 
 
 if __name__ == "__main__":
