@@ -27,6 +27,9 @@ import uvicorn
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
+from pinecone import Pinecone
+from openai import OpenAI
 
 # Only load .env locally, not on Modal
 import os
@@ -62,9 +65,7 @@ LLM_CONFIDENCE_THRESHOLD = 0.80   # accept slightly less confident LLM results
 QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belongs to.\nQuery: "
 
 
-embedding_model: SentenceTransformer = None
-pinecone_index = None
-openai_client: OpenAI = None
+
 
 
 @asynccontextmanager
