@@ -54,8 +54,7 @@ SCOPE_SYSTEM = "system"
 SCOPE_USER = "user"
 
 # Confidence thresholds
-HIGH_CONFIDENCE_MARGIN   = 0.20   # only trust embedding if VERY decisive
-LOW_CONFIDENCE_MARGIN    = 0.08   # send to LLM much more aggressively
+CONFIDENCE_MARGIN        = 0.08   # send to LLM if margin below this
 LOW_ABSOLUTE_SCORE       = 0.50   # top score must be strong to trust
 
 TOP_K                    = 100    # unchanged
@@ -638,7 +637,7 @@ async def classify_email(request: ClassifyRequest):
     second_score = sorted_labels[1][1] if len(sorted_labels) > 1 else 0.0
     margin = top_score - second_score
 
-    use_llm = (margin < LOW_CONFIDENCE_MARGIN) or (
+    use_llm = (margin < CONFIDENCE_MARGIN) or (
         top_score < LOW_ABSOLUTE_SCORE)
 
     # ── Step 5: LLM fallback if needed ───────────────────────────
