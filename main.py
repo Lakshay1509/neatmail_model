@@ -58,6 +58,7 @@ CONFIDENCE_MARGIN        = 0.08   # send to LLM if margin below this
 LOW_ABSOLUTE_SCORE       = 0.50   # top score must be strong to trust
 
 TOP_K                    = 100    # unchanged
+TOPK_MEAN_K              = 3     # average top-k matches per label (more robust than max)
 SIMILARITY_THRESHOLD     = 0.85   # store more examples (less strict dedup)
 LLM_CONFIDENCE_THRESHOLD = 0.80   # accept slightly less confident LLM results
 
@@ -607,10 +608,10 @@ async def classify_email(request: ClassifyRequest):
         f"Subject: {request.subject}\nSender: {request.sender}\nBody: {body_snippet}"
     )
 
-    # ── Step 3: Query both tiers, merge max score per label ───────
-    label_scores: dict[str, float] = {label: 0.0 for label in label_names}
+    # ── Step 3: Query both tiers, collect all scores per label ─────
+    label_hits: dict[str, list[float]] = {label: [] for label in label_names}
 
-    def query_and_merge(filter_dict: dict):
+    def query_and_collect(filter_dict: dict):
         results = pinecone_index.query(
             vector=query_vector,
             top_k=TOP_K,
@@ -620,15 +621,24 @@ async def classify_email(request: ClassifyRequest):
         )
         for match in results.matches:
             lbl = match.metadata["label"]
-            if match.score > label_scores.get(lbl, 0.0):
-                label_scores[lbl] = match.score
+            if lbl in label_hits:
+                label_hits[lbl].append(match.score)
 
     # System tier — catches legacy vectors (no scope field) and scope="system"
-    query_and_merge({"scope": {"$ne": SCOPE_USER}})
+    query_and_collect({"scope": {"$ne": SCOPE_USER}})
 
     # User tier — only this user's custom vectors
-    query_and_merge({"scope": {"$eq": SCOPE_USER},
-                    "user_id": {"$eq": user_id}})
+    query_and_collect({"scope": {"$eq": SCOPE_USER},
+                      "user_id": {"$eq": user_id}})
+
+    # Top-k mean: average the best k matches per label (more robust than max)
+    label_scores: dict[str, float] = {}
+    for label, scores in label_hits.items():
+        if not scores:
+            label_scores[label] = 0.0
+        else:
+            top_k_scores = sorted(scores, reverse=True)[:TOPK_MEAN_K]
+            label_scores[label] = sum(top_k_scores) / len(top_k_scores)
 
     # ── Step 4: Rank and check confidence ────────────────────────
     sorted_labels = sorted(label_scores.items(),
