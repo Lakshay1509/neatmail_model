@@ -17,10 +17,13 @@ Feedback loop scope mirrors the label tier:
 """
 
 import os
+import re
 import uuid
 import json
 import hashlib
+from collections import defaultdict
 from datetime import datetime, timezone
+import redis
 from typing import Optional
 from contextlib import asynccontextmanager
 import uvicorn
@@ -45,6 +48,7 @@ if not os.environ.get("MODAL_ENVIRONMENT"):
 PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
 PINECONE_INDEX = os.environ["PINECONE_INDEX_NAME"]   # dim=1024, metric=cosine
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+UPSTASH_REDIS_URL = os.environ.get("UPSTASH_REDIS_URL", "")  # redis://...:port
 
 GLOBAL_NAMESPACE = "labels"
 PROTOTYPES_PER_LABEL = 5
@@ -61,6 +65,7 @@ TOP_K                    = 100    # unchanged
 TOPK_MEAN_K              = 3     # average top-k matches per label (more robust than max)
 SIMILARITY_THRESHOLD     = 0.85   # store more examples (less strict dedup)
 LLM_CONFIDENCE_THRESHOLD = 0.80   # accept slightly less confident LLM results
+SENDER_AFFINITY_WEIGHT   = 0.15   # blend weight for sender domain affinity
 
 QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belongs to.\nQuery: "
 
@@ -70,7 +75,7 @@ QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belong
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global embedding_model, pinecone_index, openai_client
+    global embedding_model, pinecone_index, openai_client, redis_client
 
     if hasattr(app.state, "embedding_model"):
         # ── Running on Modal ──────────────────────────────────────────
@@ -93,6 +98,15 @@ async def lifespan(app: FastAPI):
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
         print("✅ All clients ready.")
+
+    # ── Redis (Upstash) for sender affinity ───────────────────────
+    if UPSTASH_REDIS_URL:
+        redis_client = redis.from_url(UPSTASH_REDIS_URL, decode_responses=True)
+        redis_client.ping()
+        print("✅ Redis (Upstash) connected.")
+    else:
+        redis_client = None
+        print("⚠️  UPSTASH_REDIS_URL not set — sender affinity disabled.")
 
     yield
 
@@ -159,6 +173,73 @@ def embed_query(text: str) -> list[float]:
         normalize_embeddings=True,
         convert_to_tensor=False
     ).tolist()
+
+
+# ─────────────────────────────────────────────
+# Sender Affinity  (Redis-backed via Upstash)
+# ─────────────────────────────────────────────
+# Keys:
+#   affinity:sys:{domain}        → hash {label: count}  (global)
+#   affinity:u:{user_id}:{domain} → hash {label: count}  (per-user)
+# Each HINCRBY = 1 command, HGETALL = 1 command.
+# ~3 commands per classification → well within Upstash free tier.
+
+
+def extract_domain(sender: str) -> str:
+    """Extract domain from sender email. 'noreply@alerts.hdfcbank.com' → 'alerts.hdfcbank.com'"""
+    match = re.search(r'@([\w.-]+)', sender)
+    return match.group(1).lower() if match else ""
+
+
+def update_sender_affinity(domain: str, label: str, user_id: str):
+    """
+    Record a classification result in Redis.
+    Updates both the global (system) and per-user affinity counters.
+    Uses HINCRBY — atomic, single command each.
+    """
+    if not domain or not redis_client:
+        return
+    pipe = redis_client.pipeline(transaction=False)
+    pipe.hincrby(f"affinity:sys:{domain}", label, 1)
+    pipe.hincrby(f"affinity:u:{user_id}:{domain}", label, 1)
+    pipe.execute()  
+
+
+def get_sender_affinity_scores(
+    domain: str, user_id: str, label_names: list[str]
+) -> dict[str, float]:
+    """
+    Compute sender affinity scores from Redis, redistributed
+    over only the labels the user has selected.
+
+    Merges system-level (all users) + user-level (personal) counts.
+    Uses a pipeline for 2 HGETALL calls in 1 round-trip.
+
+    Returns normalized scores {label: 0.0–1.0} summing to 1.0,
+    or all 0s if no affinity data exists for this domain.
+    """
+    if not domain or not redis_client:
+        return {label: 0.0 for label in label_names}
+
+    pipe = redis_client.pipeline(transaction=False)
+    pipe.hgetall(f"affinity:sys:{domain}")
+    pipe.hgetall(f"affinity:u:{user_id}:{domain}")
+    sys_counts, user_counts = pipe.execute()  
+
+    merged: dict[str, int] = defaultdict(int)
+    for lbl, count in sys_counts.items():
+        merged[lbl] += int(count)
+    for lbl, count in user_counts.items():
+        merged[lbl] += int(count)
+
+    
+    filtered = {lbl: merged.get(lbl, 0) for lbl in label_names}
+    total = sum(filtered.values())
+
+    if total == 0:
+        return {label: 0.0 for label in label_names}
+
+    return {lbl: count / total for lbl, count in filtered.items()}
 
 
 def generate_prototypes(label_name: str, description: Optional[str]) -> list[str]:
@@ -340,14 +421,16 @@ def store_learned_example(
         f"{subject}{sender}{body[:200]}".encode()
     ).hexdigest()
 
+    sender_domain = extract_domain(sender)
     metadata = {
-        "label":      label,
-        "prototype":  cleaned_text,
-        "scope":      scope,
-        "source":     "llm_fallback",
-        "email_hash": email_hash,
-        "llm_model":  "gpt-4o-mini",
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "label":         label,
+        "prototype":     cleaned_text,
+        "scope":         scope,
+        "source":        "llm_fallback",
+        "email_hash":    email_hash,
+        "sender_domain": sender_domain,
+        "llm_model":     "gpt-4o-mini",
+        "created_at":    datetime.now(timezone.utc).isoformat()
     }
     if scope == SCOPE_USER:
         # user_id only on user-scoped vectors
@@ -640,6 +723,17 @@ async def classify_email(request: ClassifyRequest):
             top_k_scores = sorted(scores, reverse=True)[:TOPK_MEAN_K]
             label_scores[label] = sum(top_k_scores) / len(top_k_scores)
 
+    # ── Step 3.5: Blend sender domain affinity with embedding scores ─
+    domain = extract_domain(request.sender)
+    affinity_scores = get_sender_affinity_scores(domain, user_id, label_names)
+    has_affinity = any(s > 0 for s in affinity_scores.values())
+    if has_affinity:
+        for lbl in label_names:
+            label_scores[lbl] = (
+                (1 - SENDER_AFFINITY_WEIGHT) * label_scores[lbl]
+                + SENDER_AFFINITY_WEIGHT * affinity_scores[lbl]
+            )
+
     # ── Step 4: Rank and check confidence ────────────────────────
     sorted_labels = sorted(label_scores.items(),
                            key=lambda x: x[1], reverse=True)
@@ -686,6 +780,7 @@ async def classify_email(request: ClassifyRequest):
             print(
                 f"⚠️  LLM confidence too low ({llm_confidence:.2f}) — skipping storage")
 
+        update_sender_affinity(domain, llm_label, user_id)
         return ClassifyResponse(
             label=llm_label,
             confidence=round(top_score, 4),
@@ -694,6 +789,7 @@ async def classify_email(request: ClassifyRequest):
             all_scores={k: round(v, 4) for k, v in label_scores.items()}
         )
 
+    update_sender_affinity(domain, top_label, user_id)
     return ClassifyResponse(
         label=top_label,
         confidence=round(top_score, 4),
