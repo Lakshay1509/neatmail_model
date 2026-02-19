@@ -51,7 +51,7 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 UPSTASH_REDIS_URL = os.environ.get("UPSTASH_REDIS_URL", "")  # redis://...:port
 
 GLOBAL_NAMESPACE = "labels"
-PROTOTYPES_PER_LABEL = 5
+PROTOTYPES_PER_LABEL = 10
 
 
 SCOPE_SYSTEM = "system"
@@ -257,6 +257,7 @@ Each prototype should:
 - Cover a DIFFERENT sub-type of "{label_name}" emails
 - Read like a real email with subject and body
 - Be 4-6 sentences long
+- Cover different types of scenerios
 - NOT use placeholder text like [Company Name]
 
 Return ONLY a JSON object with key "prototypes" containing an array of {PROTOTYPES_PER_LABEL} strings.
