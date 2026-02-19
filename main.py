@@ -145,6 +145,7 @@ class ClassifyRequest(BaseModel):
     sender: str
     body: str
     labels: list[str]
+    use_llm: bool
 
 
 class ClassifyResponse(BaseModel):
@@ -742,8 +743,8 @@ async def classify_email(request: ClassifyRequest):
     second_score = sorted_labels[1][1] if len(sorted_labels) > 1 else 0.0
     margin = top_score - second_score
 
-    use_llm = (margin < CONFIDENCE_MARGIN) or (
-        top_score < LOW_ABSOLUTE_SCORE)
+    use_llm = ((margin < CONFIDENCE_MARGIN) or (
+        top_score < LOW_ABSOLUTE_SCORE) and request.use_llm)
 
     # ── Step 5: LLM fallback if needed ───────────────────────────
     if use_llm:
