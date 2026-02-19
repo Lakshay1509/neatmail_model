@@ -13,6 +13,7 @@ image = (
         "openai",
         "uvicorn",
         "python-dotenv",
+        "redis"
     ])
     .run_commands(
         "python -c \""
