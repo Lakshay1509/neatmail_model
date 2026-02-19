@@ -145,8 +145,7 @@ class ClassifyRequest(BaseModel):
     sender: str
     body: str
     labels: list[str]
-    use_llm: bool
-
+    use_llm: Optional[bool] = True
 
 class ClassifyResponse(BaseModel):
     label: str
