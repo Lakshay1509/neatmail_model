@@ -66,8 +66,8 @@ SCOPE_SYSTEM = "system"
 SCOPE_USER = "user"
 
 # Confidence thresholds
-CONFIDENCE_MARGIN        = 0.08   # send to LLM if margin below this
-LOW_ABSOLUTE_SCORE       = 0.50   # top score must be strong to trust
+CONFIDENCE_MARGIN        = 0.08   # send to LLM if margin below this (tighter — reranker widens margins)
+LOW_ABSOLUTE_SCORE       = 0.35   # top score must be strong to trust (lowered for blended score scale)
 
 TOP_K                    = 100    # unchanged
 TOPK_MEAN_K              = 3     # average top-k matches per label (more robust than max)
@@ -78,7 +78,7 @@ SENDER_AFFINITY_WEIGHT   = 0.08   # blend weight for per-user sender affinity (r
 # Cross-encoder reranker
 RERANKER_MODEL_NAME      = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 RERANKER_TOP_N           = 5      # rerank top-N label candidates
-RERANKER_BLEND_WEIGHT    = 0.55   # cross-encoder vs embedding weight for reranked labels
+RERANKER_BLEND_WEIGHT    = 0.40   # cross-encoder vs embedding weight for reranked labels (reduced to preserve score magnitude)
 
 # Structural feature prior boost (zero-ML)
 STRUCTURAL_BOOST_WEIGHT  = 0.10   # blend weight for structural signal prior
