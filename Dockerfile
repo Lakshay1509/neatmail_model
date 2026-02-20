@@ -11,7 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download the embedding model into the image layer
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('Qwen/Qwen3-Embedding-0.6B')"
+RUN python -c "from sentence_transformers import SentenceTransformer, CrossEncoder; SentenceTransformer('Qwen/Qwen3-Embedding-0.6B'); CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
 
 # Copy application source
 COPY main.py .

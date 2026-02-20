@@ -17,8 +17,9 @@ image = (
     ])
     .run_commands(
         "python -c \""
-        "from sentence_transformers import SentenceTransformer; "
-        "SentenceTransformer('Qwen/Qwen3-Embedding-0.6B')"
+        "from sentence_transformers import SentenceTransformer, CrossEncoder; "
+        "SentenceTransformer('Qwen/Qwen3-Embedding-0.6B'); "
+        "CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
         "\""
     )
     .add_local_python_source("main")
@@ -41,11 +42,14 @@ class EmailClassifier:
 
     @modal.enter(snap=True)
     def load_model(self):
-        from sentence_transformers import SentenceTransformer
+        from sentence_transformers import SentenceTransformer, CrossEncoder
         print("Loading embedding model...")
         self.embedding_model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
         self.embedding_model.encode("warmup", normalize_embeddings=True)
-        print("Model ready.")
+        print("Loading cross-encoder reranker...")
+        self.reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        self.reranker_model.predict([("warmup query", "warmup document")])
+        print("Models ready.")
 
     @modal.enter(snap=False)
     def init_clients(self):
@@ -66,5 +70,6 @@ class EmailClassifier:
         fastapi_app.state.embedding_model = self.embedding_model
         fastapi_app.state.pinecone_index = self.pinecone_index
         fastapi_app.state.openai_client = self.openai_client
+        fastapi_app.state.reranker_model = self.reranker_model
 
         return fastapi_app

@@ -1,6 +1,17 @@
 """
 Email Classifier API
-Stack: FastAPI + Pinecone (v3) + Qwen3-Embedding-0.6B + GPT-4o-mini fallback
+Stack: FastAPI + Pinecone (v3) + Qwen3-Embedding-0.6B
+     + cross-encoder/ms-marco-MiniLM-L-6-v2 (reranker)
+     + GPT-4o-mini fallback
+
+Classification pipeline:
+  1. Bi-encoder retrieval      — Qwen3 embeddings vs Pinecone prototypes
+  2. Structural features       — zero-ML regex patterns (unsubscribe, currency, etc.)
+  3. Sender reputation         — Bayesian-smoothed global cross-user domain signal
+  4. Per-user sender affinity   — this user's personal domain history
+  5. Cross-encoder reranking   — top-5 candidates rescored with joint attention
+  6. Confidence routing        — high confidence → return, low → GPT-4o-mini fallback
+  7. Feedback loop             — LLM-confirmed results stored back into Pinecone
 
 Label storage — single namespace, two tiers via metadata:
   • System labels  — scope field absent OR scope="system"
@@ -9,17 +20,13 @@ Label storage — single namespace, two tiers via metadata:
   • User labels    — scope="user" + user_id field
                      Per-user custom labels. Same name can mean different things
                      for different users. Managed via POST /user/label.
-
-Classification queries both tiers separately and merges scores (max per label).
-Feedback loop scope mirrors the label tier:
-  • System label → learned example stored as scope="system" (improves globally for all users)
-  • User label   → learned example stored as scope="user" (stays private to that user)
 """
 
 import os
 import re
 import uuid
 import json
+import math
 import hashlib
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -30,7 +37,7 @@ import uvicorn
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from pinecone import Pinecone
 from openai import OpenAI
 
@@ -65,7 +72,20 @@ TOP_K                    = 100    # unchanged
 TOPK_MEAN_K              = 3     # average top-k matches per label (more robust than max)
 SIMILARITY_THRESHOLD     = 0.85   # store more examples (less strict dedup)
 LLM_CONFIDENCE_THRESHOLD = 0.80   # accept slightly less confident LLM results
-SENDER_AFFINITY_WEIGHT   = 0.15   # blend weight for sender domain affinity
+SENDER_AFFINITY_WEIGHT   = 0.08   # blend weight for per-user sender affinity (reduced; reputation takes rest)
+
+# Cross-encoder reranker
+RERANKER_MODEL_NAME      = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANKER_TOP_N           = 5      # rerank top-N label candidates
+RERANKER_BLEND_WEIGHT    = 0.55   # cross-encoder vs embedding weight for reranked labels
+
+# Structural feature prior boost (zero-ML)
+STRUCTURAL_BOOST_WEIGHT  = 0.10   # blend weight for structural signal prior
+
+# Sender reputation (global Bayesian-smoothed, collaborative filtering)
+REPUTATION_PRIOR_STRENGTH = 10.0  # Bayesian pseudo-count for smoothing
+REPUTATION_MIN_OBSERVATIONS = 30  # observations needed for full confidence
+SENDER_REPUTATION_WEIGHT = 0.12   # blend weight for global reputation
 
 QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belongs to.\nQuery: "
 
@@ -75,7 +95,7 @@ QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belong
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global embedding_model, pinecone_index, openai_client, redis_client
+    global embedding_model, pinecone_index, openai_client, redis_client, reranker_model
 
     if hasattr(app.state, "embedding_model"):
         # ── Running on Modal ──────────────────────────────────────────
@@ -84,11 +104,15 @@ async def lifespan(app: FastAPI):
         embedding_model = app.state.embedding_model
         pinecone_index = app.state.pinecone_index
         openai_client = app.state.openai_client
+        reranker_model = app.state.reranker_model
         print("✅ Clients ready (restored from Modal snapshot).")
     else:
         # ── Local development fallback ────────────────────────────────
         print("Loading Qwen3 embedding model...")
         embedding_model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
+
+        print("Loading cross-encoder reranker...")
+        reranker_model = CrossEncoder(RERANKER_MODEL_NAME)
 
         print("Connecting to Pinecone...")
         pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -153,6 +177,7 @@ class ClassifyResponse(BaseModel):
     margin: float
     method: str
     all_scores: dict[str, float]
+   
 
 
 def embed_document(text: str) -> list[float]:
@@ -176,13 +201,198 @@ def embed_query(text: str) -> list[float]:
 
 
 # ─────────────────────────────────────────────
+# Structural Feature Extraction  (zero-ML prior boost)
+# ─────────────────────────────────────────────
+# Detects structural patterns in raw email text (unsubscribe links,
+# currency symbols, calendar/.ics references, tracking numbers, OTP
+# codes, etc.) and maps them to broad semantic categories.  These are
+# then fuzzy-matched to the user's actual label names and blended as
+# a lightweight prior signal — no model inference required.
+
+STRUCTURAL_PATTERNS: dict[str, re.Pattern] = {
+    "unsubscribe": re.compile(
+        r'(?i)(unsubscribe|opt[\s-]?out|email[\s-]?preferences'
+        r'|manage[\s-]?subscriptions?|view\s+in\s+browser|email\s+settings)'
+    ),
+    "currency": re.compile(
+        r'[₹$€£¥]\s?\d[\d,.]*|\d[\d,.]*\s?(?:USD|INR|EUR|GBP|Rs\.?)'
+    ),
+    "calendar": re.compile(
+        r'(?i)(\.ics|calendar\s?invite|event\s?invitation|add\s?to\s?calendar'
+        r'|when:.*where:|rsvp|google\s?calendar|starts?\s?at\s?\d)'
+    ),
+    "tracking": re.compile(
+        r'(?i)(tracking\s?(?:number|id|#|code)|shipment\s|shipped|'
+        r'delivered|out\s?for\s?delivery|in\s?transit|dispatch)'
+    ),
+    "otp": re.compile(
+        r'(?i)(otp|one[\s-]?time[\s-]?password|verification\s?code'
+        r'|security\s?code|(?:code|pin)\s*[:=]\s*\d{4,8})'
+    ),
+    "action_required": re.compile(
+        r'(?i)(action\s?required|urgent|immediate\s?attention|deadline'
+        r'|due\s?(?:date|by)|expires?\s?(?:on|in|soon)|respond\s?by)'
+    ),
+    "social": re.compile(
+        r'(?i)(liked?\s+your|commented?\s+on|mentioned?\s+you'
+        r'|tagged?\s+you|new\s?follower|friend\s?request|connection\s?request)'
+    ),
+    "newsletter": re.compile(
+        r'(?i)(weekly\s?digest|daily\s?roundup|newsletter'
+        r'|read\s?more\s?articles?|top\s?stories|in\s?this\s?issue)'
+    ),
+}
+
+# Each structural signal maps to broad semantic categories with confidence
+SIGNAL_TO_CATEGORY: dict[str, dict[str, float]] = {
+    "unsubscribe":     {"marketing": 0.70, "newsletter": 0.50, "promotions": 0.60},
+    "currency":        {"finance": 0.60, "orders": 0.30, "payments": 0.55},
+    "calendar":        {"events": 0.80, "meetings": 0.65},
+    "tracking":        {"orders": 0.70, "updates": 0.30, "shipping": 0.65},
+    "otp":             {"security": 0.70, "alerts": 0.50, "automated": 0.40},
+    "action_required": {"urgent": 0.60, "important": 0.50, "action": 0.55},
+    "social":          {"social": 0.70, "notifications": 0.40},
+    "newsletter":      {"newsletter": 0.60, "marketing": 0.30},
+}
+
+# Keyword stems used to fuzzy-match broad categories → user label names
+CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "marketing":     ["market", "promot", "advert", "deal", "offer", "sale", "discount", "promo"],
+    "newsletter":    ["newsletter", "digest", "roundup", "weekly", "daily", "bulletin"],
+    "finance":       ["financ", "payment", "bank", "transaction", "money", "bill", "invoice", "upi"],
+    "orders":        ["order", "ship", "deliver", "package", "track", "purchase", "cart"],
+    "events":        ["event", "calendar", "meeting", "invit", "rsvp", "webinar", "conference"],
+    "security":      ["secur", "otp", "verif", "auth", "password", "2fa", "login"],
+    "alerts":        ["alert", "automat", "notif", "system", "warning"],
+    "urgent":        ["urgent", "action", "deadline", "critical", "asap"],
+    "important":     ["important", "priority", "flag", "starred"],
+    "social":        ["social", "facebook", "twitter", "linkedin", "instagram", "follower"],
+    "updates":       ["update", "status", "change", "news", "progress"],
+    "promotions":    ["promot", "deal", "offer", "discount", "coupon", "sale", "clearance"],
+    "notifications": ["notif", "ping", "mention", "activity"],
+    "payments":      ["payment", "pay", "invoice", "receipt", "billing"],
+    "shipping":      ["ship", "deliver", "courier", "logistics", "freight"],
+    "meetings":      ["meeting", "standup", "sync", "call", "huddle"],
+    "automated":     ["automat", "bot", "noreply", "system", "generated"],
+    "action":        ["action", "todo", "task", "assign", "require"],
+}
+
+
+def extract_structural_signals(subject: str, sender: str, body: str) -> dict[str, bool]:
+    """Detect structural patterns in raw email text. Returns {signal_name: detected}."""
+    text = f"{subject}\n{sender}\n{body}"
+    return {
+        signal: bool(pattern.search(text))
+        for signal, pattern in STRUCTURAL_PATTERNS.items()
+    }
+
+
+def _category_matches_label(category: str, label: str) -> bool:
+    """Check if a broad category matches a user's label via keyword stems."""
+    label_lower = label.lower()
+    if category in label_lower or label_lower in category:
+        return True
+    keywords = CATEGORY_KEYWORDS.get(category, [])
+    return any(kw in label_lower for kw in keywords)
+
+
+def compute_structural_boost(
+    signals: dict[str, bool], label_names: list[str]
+) -> dict[str, float]:
+    """
+    Convert detected structural signals into per-label boost scores.
+    Maps broad categories to user's actual labels via fuzzy keyword matching.
+    Returns {label: 0.0–1.0} — max signal confidence per label.
+    """
+    boosts: dict[str, float] = {lbl: 0.0 for lbl in label_names}
+
+    for signal, detected in signals.items():
+        if not detected:
+            continue
+        category_hints = SIGNAL_TO_CATEGORY.get(signal, {})
+        for category, confidence in category_hints.items():
+            for label in label_names:
+                if _category_matches_label(category, label):
+                    boosts[label] = max(boosts[label], confidence)
+
+    return boosts
+
+
+# ─────────────────────────────────────────────
+# Cross-Encoder Reranker
+# ─────────────────────────────────────────────
+# After bi-encoder retrieval, the top-N label candidates are rescored
+# using a cross-encoder that jointly attends to (email, prototype).
+# This dramatically improves discrimination between close categories
+# (e.g. "Finance" vs "Automated alerts") at ~10ms cost per call.
+
+
+def rerank_top_labels(
+    email_text: str,
+    label_prototypes: dict[str, list[tuple[float, str]]],
+    embedding_scores: dict[str, float],
+    top_n: int = RERANKER_TOP_N,
+) -> dict[str, float]:
+    """
+    Rerank top-N labels using the cross-encoder model.
+
+    For each candidate label, takes the best bi-encoder prototype
+    and cross-encodes it with the email text. The cross-encoder score
+    is blended with the original embedding score.
+
+    Returns updated {label: blended_score} dict for ALL labels
+    (non-top-N labels keep their original embedding score).
+    """
+    sorted_labels = sorted(
+        embedding_scores.items(), key=lambda x: x[1], reverse=True
+    )
+    top_labels = [lbl for lbl, sc in sorted_labels[:top_n] if sc > 0]
+
+    if not top_labels:
+        return dict(embedding_scores)
+
+    # Build (email, best_prototype) pairs for each top candidate
+    pairs = []
+    pair_labels = []
+    for lbl in top_labels:
+        protos = label_prototypes.get(lbl, [])
+        if protos:
+            best_proto = max(protos, key=lambda x: x[0])[1]
+            pairs.append((email_text, best_proto))
+            pair_labels.append(lbl)
+
+    if not pairs:
+        return dict(embedding_scores)
+
+    # Batch cross-encode — single forward pass
+    raw_scores = reranker_model.predict(pairs)
+
+    # Sigmoid to [0, 1]
+    sigmoid_scores = [1.0 / (1.0 + math.exp(-float(s))) for s in raw_scores]
+
+    # Blend with embedding scores for reranked labels
+    updated = dict(embedding_scores)
+    for lbl, ce_score in zip(pair_labels, sigmoid_scores):
+        updated[lbl] = (
+            RERANKER_BLEND_WEIGHT * ce_score
+            + (1 - RERANKER_BLEND_WEIGHT) * embedding_scores[lbl]
+        )
+
+    return updated
+
+
+# ─────────────────────────────────────────────
 # Sender Affinity  (Redis-backed via Upstash)
 # ─────────────────────────────────────────────
 # Keys:
-#   affinity:sys:{domain}        → hash {label: count}  (global)
-#   affinity:u:{user_id}:{domain} → hash {label: count}  (per-user)
-# Each HINCRBY = 1 command, HGETALL = 1 command.
-# ~3 commands per classification → well within Upstash free tier.
+#   affinity:sys:{domain}          → hash {label: count}  (global)
+#   affinity:u:{user_id}:{domain}  → hash {label: count}  (per-user)
+#   rep:users:{domain}:{label}     → set of user_ids     (unique user tracking)
+#
+# The unique-user sets power Bayesian-smoothed sender reputation:
+# domains classified consistently across many users get higher
+# confidence, acting as collaborative filtering for new users.
+# ~4 commands per classification → well within Upstash free tier.
 
 
 def extract_domain(sender: str) -> str:
@@ -194,14 +404,15 @@ def extract_domain(sender: str) -> str:
 def update_sender_affinity(domain: str, label: str, user_id: str):
     """
     Record a classification result in Redis.
-    Updates both the global (system) and per-user affinity counters.
-    Uses HINCRBY — atomic, single command each.
+    Updates global counts, per-user counts, AND the unique-user set
+    for this domain-label pair (powers the sender reputation graph).
     """
     if not domain or not redis_client:
         return
     pipe = redis_client.pipeline(transaction=False)
     pipe.hincrby(f"affinity:sys:{domain}", label, 1)
     pipe.hincrby(f"affinity:u:{user_id}:{domain}", label, 1)
+    pipe.sadd(f"rep:users:{domain}:{label}", user_id)   # unique user tracking
     pipe.execute()  
 
 
@@ -209,37 +420,67 @@ def get_sender_affinity_scores(
     domain: str, user_id: str, label_names: list[str]
 ) -> dict[str, float]:
     """
-    Compute sender affinity scores from Redis, redistributed
-    over only the labels the user has selected.
-
-    Merges system-level (all users) + user-level (personal) counts.
-    Uses a pipeline for 2 HGETALL calls in 1 round-trip.
-
+    Per-user sender affinity — this user's personal history with a domain.
     Returns normalized scores {label: 0.0–1.0} summing to 1.0,
-    or all 0s if no affinity data exists for this domain.
+    or all 0s if no affinity data exists.
     """
     if not domain or not redis_client:
         return {label: 0.0 for label in label_names}
 
-    pipe = redis_client.pipeline(transaction=False)
-    pipe.hgetall(f"affinity:sys:{domain}")
-    pipe.hgetall(f"affinity:u:{user_id}:{domain}")
-    sys_counts, user_counts = pipe.execute()  
+    user_counts = redis_client.hgetall(f"affinity:u:{user_id}:{domain}")
+    if not user_counts:
+        return {label: 0.0 for label in label_names}
 
-    merged: dict[str, int] = defaultdict(int)
-    for lbl, count in sys_counts.items():
-        merged[lbl] += int(count)
-    for lbl, count in user_counts.items():
-        merged[lbl] += int(count)
-
-    
-    filtered = {lbl: merged.get(lbl, 0) for lbl in label_names}
+    filtered = {lbl: int(user_counts.get(lbl, 0)) for lbl in label_names}
     total = sum(filtered.values())
 
     if total == 0:
         return {label: 0.0 for label in label_names}
 
     return {lbl: count / total for lbl, count in filtered.items()}
+
+
+def get_sender_reputation_scores(
+    domain: str, label_names: list[str]
+) -> dict[str, float]:
+    """
+    Global sender reputation with Bayesian smoothing.
+
+    Uses classification history across ALL users for this sender domain.
+    Applies Laplace-style smoothing so domains with few observations
+    produce weak signals, while heavily-observed domains produce strong ones.
+
+    Confidence ramps linearly from 0 → 1 as observation count reaches
+    REPUTATION_MIN_OBSERVATIONS (default 30).  This means a brand-new user
+    immediately benefits from the collective knowledge of all other users
+    who received mail from the same domain.
+
+    Returns {label: 0.0–1.0} — NOT normalised to sum to 1 because the
+    confidence scaling already tempers the magnitudes.
+    """
+    if not domain or not redis_client:
+        return {label: 0.0 for label in label_names}
+
+    sys_counts = redis_client.hgetall(f"affinity:sys:{domain}")
+    if not sys_counts:
+        return {label: 0.0 for label in label_names}
+
+    total = sum(int(c) for c in sys_counts.values())
+    n_labels = max(len(label_names), 1)
+
+    # Bayesian smoothing: (count + prior) / (total + prior × categories)
+    prior = REPUTATION_PRIOR_STRENGTH / n_labels
+    denominator = total + REPUTATION_PRIOR_STRENGTH
+
+    smoothed = {}
+    for lbl in label_names:
+        count = int(sys_counts.get(lbl, 0))
+        smoothed[lbl] = (count + prior) / denominator
+
+    # Confidence ramp — don't trust few observations
+    confidence = min(1.0, total / REPUTATION_MIN_OBSERVATIONS)
+
+    return {lbl: s * confidence for lbl, s in smoothed.items()}
 
 
 def generate_prototypes(label_name: str, description: Optional[str]) -> list[str]:
@@ -637,16 +878,16 @@ async def classify_email(request: ClassifyRequest):
     """
     Classifies email against the user's chosen labels.
 
-    For each label, we check both tiers:
-      - System tier:  scope != "user"  (catches legacy DB vectors + new scope="system" ones)
-      - User tier:    scope = "user" AND user_id = <this user>
-
-    Scores from both tiers are merged (max per label), then confidence routing decides
-    whether to use embedding result or fall back to GPT-4o-mini.
-
-    Feedback loop scope follows the label tier:
-      - System label → stored as scope="system" so ALL users benefit from the learned example.
-      - User label   → stored as scope="user" + user_id, stays private to this user.
+    Pipeline (executed in order):
+      1. Validate labels exist (system + user tiers)
+      2. Embed email → bi-encoder retrieval from Pinecone (both tiers)
+      3. Structural feature extraction — zero-ML pattern matching
+      4. Sender reputation — Bayesian-smoothed global cross-user signal
+      5. Per-user sender affinity — this user's history with the domain
+      6. Score blending — weighted combination of all signals
+      7. Cross-encoder reranking — top-5 candidates rescored jointly
+      8. Confidence routing → embedding result OR GPT-4o-mini fallback
+      9. Feedback loop — learned examples stored scoped to label tier
     """
     if not request.labels:
         raise HTTPException(
@@ -688,12 +929,14 @@ async def classify_email(request: ClassifyRequest):
         else request.body
     )
 
-    query_vector = embed_query(
-        f"Subject: {request.subject}\nSender: {request.sender}\nBody: {body_snippet}"
-    )
+    email_text = f"Subject: {request.subject}\nSender: {request.sender}\nBody: {body_snippet}"
+    query_vector = embed_query(email_text)
 
-    # ── Step 3: Query both tiers, collect all scores per label ─────
+    # ── Step 3: Query both tiers, collect scores + prototype texts ─
     label_hits: dict[str, list[float]] = {label: [] for label in label_names}
+    label_prototypes: dict[str, list[tuple[float, str]]] = {
+        label: [] for label in label_names
+    }
 
     def query_and_collect(filter_dict: dict):
         results = pinecone_index.query(
@@ -707,6 +950,9 @@ async def classify_email(request: ClassifyRequest):
             lbl = match.metadata["label"]
             if lbl in label_hits:
                 label_hits[lbl].append(match.score)
+                proto = match.metadata.get("prototype", "")
+                if proto:
+                    label_prototypes[lbl].append((match.score, proto))
 
     # System tier — catches legacy vectors (no scope field) and scope="system"
     query_and_collect({"scope": {"$ne": SCOPE_USER}})
@@ -715,27 +961,61 @@ async def classify_email(request: ClassifyRequest):
     query_and_collect({"scope": {"$eq": SCOPE_USER},
                       "user_id": {"$eq": user_id}})
 
-    # Top-k mean: average the best k matches per label (more robust than max)
-    label_scores: dict[str, float] = {}
+    # Top-k mean: average the best k matches per label
+    embedding_scores: dict[str, float] = {}
     for label, scores in label_hits.items():
         if not scores:
-            label_scores[label] = 0.0
+            embedding_scores[label] = 0.0
         else:
             top_k_scores = sorted(scores, reverse=True)[:TOPK_MEAN_K]
-            label_scores[label] = sum(top_k_scores) / len(top_k_scores)
+            embedding_scores[label] = sum(top_k_scores) / len(top_k_scores)
 
-    # ── Step 3.5: Blend sender domain affinity with embedding scores ─
+    # ── Step 4: Structural feature extraction ─────────────────────
+    structural_signals = extract_structural_signals(
+        request.subject, request.sender, request.body
+    )
+    structural_boost = compute_structural_boost(structural_signals, label_names)
+    has_structural = any(v > 0 for v in structural_boost.values())
+
+    # ── Step 5: Sender reputation + per-user affinity ─────────────
     domain = extract_domain(request.sender)
-    affinity_scores = get_sender_affinity_scores(domain, user_id, label_names)
-    has_affinity = any(s > 0 for s in affinity_scores.values())
-    if has_affinity:
-        for lbl in label_names:
-            label_scores[lbl] = (
-                (1 - SENDER_AFFINITY_WEIGHT) * label_scores[lbl]
-                + SENDER_AFFINITY_WEIGHT * affinity_scores[lbl]
-            )
+    reputation_scores = get_sender_reputation_scores(domain, label_names)
+    has_reputation = any(v > 0 for v in reputation_scores.values())
 
-    # ── Step 4: Rank and check confidence ────────────────────────
+    affinity_scores = get_sender_affinity_scores(domain, user_id, label_names)
+    has_affinity = any(v > 0 for v in affinity_scores.values())
+
+    # ── Step 6: Blend all signals ─────────────────────────────────
+    # Dynamic weight allocation: when a signal is inactive, its weight
+    # is redistributed proportionally to the active signals.
+    raw_weights = {"embedding": 1.0}    # always active
+    if has_structural:
+        raw_weights["structural"] = STRUCTURAL_BOOST_WEIGHT
+    if has_reputation:
+        raw_weights["reputation"] = SENDER_REPUTATION_WEIGHT
+    if has_affinity:
+        raw_weights["affinity"] = SENDER_AFFINITY_WEIGHT
+
+    total_weight = sum(raw_weights.values())
+    w = {k: v / total_weight for k, v in raw_weights.items()}
+
+    label_scores: dict[str, float] = {}
+    for lbl in label_names:
+        score = w["embedding"] * embedding_scores[lbl]
+        if has_structural:
+            score += w["structural"] * structural_boost[lbl]
+        if has_reputation:
+            score += w["reputation"] * reputation_scores[lbl]
+        if has_affinity:
+            score += w["affinity"] * affinity_scores[lbl]
+        label_scores[lbl] = score
+
+    # ── Step 7: Cross-encoder reranking ───────────────────────────
+    label_scores = rerank_top_labels(
+        email_text, label_prototypes, label_scores
+    )
+
+    # ── Step 8: Rank and check confidence ────────────────────────
     sorted_labels = sorted(label_scores.items(),
                            key=lambda x: x[1], reverse=True)
     top_label, top_score = sorted_labels[0]
@@ -743,19 +1023,28 @@ async def classify_email(request: ClassifyRequest):
     margin = top_score - second_score
 
     use_llm = ((margin < CONFIDENCE_MARGIN) or (
-        top_score < LOW_ABSOLUTE_SCORE) and request.use_llm)
+        top_score < LOW_ABSOLUTE_SCORE)) and request.use_llm
 
-    # ── Step 5: LLM fallback if needed ───────────────────────────
+    # Build method string showing which signals contributed
+    method_parts = ["embedding"]
+    if has_structural:
+        method_parts.append("structural")
+    if has_reputation:
+        method_parts.append("reputation")
+    if has_affinity:
+        method_parts.append("affinity")
+    method_parts.append("reranker")
+
+    # ── Step 9: LLM fallback if needed ───────────────────────────
     if use_llm:
         llm_label, llm_confidence = llm_classify(
             subject=request.subject,
             sender=request.sender,
             body=request.body,
-            label_names=label_names          # only THIS user's requested labels, not all labels
+            label_names=label_names
         )
 
         # Feedback loop — scope depends on whether the label is system or user-custom.
-        # System labels (e.g. "action needed") improve globally; user labels stay private.
         if llm_confidence >= LLM_CONFIDENCE_THRESHOLD:
             is_system_label = pinecone_index.query(
                 vector=query_vector,
@@ -786,8 +1075,9 @@ async def classify_email(request: ClassifyRequest):
             label=llm_label,
             confidence=round(top_score, 4),
             margin=round(margin, 4),
-            method="llm_fallback",
-            all_scores={k: round(v, 4) for k, v in label_scores.items()}
+            method="llm_fallback+" + "+".join(method_parts),
+            all_scores={k: round(v, 4) for k, v in label_scores.items()},
+            
         )
 
     update_sender_affinity(domain, top_label, user_id)
@@ -795,8 +1085,9 @@ async def classify_email(request: ClassifyRequest):
         label=top_label,
         confidence=round(top_score, 4),
         margin=round(margin, 4),
-        method="embedding",
-        all_scores={k: round(v, 4) for k, v in label_scores.items()}
+        method="+".join(method_parts),
+        all_scores={k: round(v, 4) for k, v in label_scores.items()},
+        
     )
 
 
