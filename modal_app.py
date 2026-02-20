@@ -23,6 +23,7 @@ image = (
         "\""
     )
     .add_local_python_source("main")
+    .add_local_python_source("structural_patterns")
 )
 
 app = modal.App("email-classifier", image=image)

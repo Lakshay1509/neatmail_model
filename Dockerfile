@@ -15,6 +15,7 @@ RUN python -c "from sentence_transformers import SentenceTransformer, CrossEncod
 
 # Copy application source
 COPY main.py .
+COPY structural_patterns.py .
 
 EXPOSE 8000
 
