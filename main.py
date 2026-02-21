@@ -41,7 +41,8 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from pinecone import Pinecone
 from openai import OpenAI
-from structural_patterns import STRUCTURAL_PATTERNS, SIGNAL_TO_CATEGORY, CATEGORY_KEYWORDS
+from structural_patterns import STRUCTURAL_PATTERNS, SIGNAL_TO_CATEGORY, CATEGORY_KEYWORDS, PII_LABELS
+from gliner import GLiNER
 
 # Only load .env locally, not on Modal
 import os
@@ -89,6 +90,9 @@ REPUTATION_PRIOR_STRENGTH = 10.0  # Bayesian pseudo-count for smoothing
 REPUTATION_MIN_OBSERVATIONS = 30  # observations needed for full confidence
 SENDER_REPUTATION_WEIGHT = 0.12   # blend weight for global reputation
 
+#PII model
+PII_MODEL="urchade/gliner_small-v2.1"
+
 QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belongs to.\nQuery: "
 
 
@@ -97,7 +101,7 @@ QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belong
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global embedding_model, pinecone_index, openai_client, redis_client, reranker_model
+    global embedding_model, pinecone_index, openai_client, redis_client, reranker_model, pii_model
 
     if hasattr(app.state, "embedding_model"):
         # ── Running on Modal ──────────────────────────────────────────
@@ -115,6 +119,9 @@ async def lifespan(app: FastAPI):
 
         print("Loading cross-encoder reranker...")
         reranker_model = CrossEncoder(RERANKER_MODEL_NAME)
+
+        print("Loading PII model")
+        pii_model = GLiNER.from_pretrained(PII_MODEL)
 
         print("Connecting to Pinecone...")
         pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -173,12 +180,20 @@ class ClassifyRequest(BaseModel):
     labels: list[str]
     use_llm: Optional[bool] = True
 
+class Email(BaseModel):
+    subject: str
+    sender: str
+    body: str
+
 class ClassifyResponse(BaseModel):
     label: str
     confidence: float
     margin: float
     method: str
     all_scores: dict[str, float]
+    email: Email
+
+
    
 
 
@@ -509,29 +524,34 @@ Format: {{"label": "Marketing", "confidence": 0.95}}
     return predicted, llm_confidence
 
 
-def clean_email_for_storage(subject: str, sender: str, body: str) -> str:
+def clean_email_for_storage(subject: str, sender: str, body: str, return_structured:bool=False) -> str|dict:
     """
     Strip personal info before storing as a learned example.
     Keeps the pattern and intent, removes user-specific noise.
     """
-    prompt = f"""
-Clean the following email for use as a training example in an email classifier.
-Remove: names, order numbers, specific dates, account numbers, personal details, phone numbers.
-Keep: the subject pattern, intent, key phrases, general content structure.
-Return ONLY the cleaned email text, no explanation.
+    full_text = f"Subject: {subject}\nSender: {sender}\nBody: {body[:500]}"
 
-Subject: {subject}
-Sender: {sender}
-Body: {body[:500]}
-"""
 
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
+    entities = pii_model.predict_entities(full_text, PII_LABELS, threshold=0.4)
 
-    return response.choices[0].message.content.strip()
+    # Sort in reverse order so replacements don't shift character positions
+    entities = sorted(entities, key=lambda e: e["start"], reverse=True)
+
+    cleaned = full_text
+    for entity in entities:
+        placeholder = f"[{entity['label'].upper().replace(' ', '_')}]"
+        cleaned = cleaned[:entity["start"]] + placeholder + cleaned[entity["end"]:]
+
+    if not return_structured:
+        return cleaned.strip()
+
+    # Parse back into subject, sender, body
+    lines = cleaned.split("\n", 2)
+    return {
+        "subject": lines[0].removeprefix("Subject: ").strip() if len(lines) > 0 else "",
+        "sender":  lines[1].removeprefix("Sender: ").strip()  if len(lines) > 1 else "",
+        "body":    lines[2].removeprefix("Body: ").strip()    if len(lines) > 2 else "",
+    }
 
 
 def is_already_covered(vector: list[float], label: str, extra_filter: dict) -> bool:
@@ -975,10 +995,16 @@ async def classify_email(request: ClassifyRequest):
 
     # ── Step 9: LLM fallback if needed ───────────────────────────
     if use_llm:
-        llm_label, llm_confidence = llm_classify(
+        cleaned_email = clean_email_for_storage(
             subject=request.subject,
             sender=request.sender,
             body=request.body,
+            return_structured=True
+        )
+        llm_label, llm_confidence = llm_classify(
+            subject=cleaned_email["subject"],
+            sender=cleaned_email["sender"],
+            body=cleaned_email["body"],
             label_names=label_names
         )
 
@@ -1015,6 +1041,11 @@ async def classify_email(request: ClassifyRequest):
             margin=round(margin, 4),
             method="llm_fallback+" + "+".join(method_parts),
             all_scores={k: round(v, 4) for k, v in label_scores.items()},
+            email=Email(
+                subject=cleaned_email["subject"],
+                sender=cleaned_email["sender"],
+                body=cleaned_email["body"],
+            )
             
         )
 

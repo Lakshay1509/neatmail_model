@@ -5,3 +5,4 @@ pinecone
 openai
 python-dotenv
 redis
+gliner

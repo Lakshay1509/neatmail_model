@@ -93,3 +93,40 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "automated":     ["automat", "bot", "noreply", "system", "generated"],
     "action":        ["action", "todo", "task", "assign", "require"],
 }
+
+PII_LABELS = [
+    # Names & Identity
+    "full name", "first name", "last name", "person name",
+    "date of birth", "age",
+
+    # Contact
+    "email address", "phone number",
+    "street address", "city", "state", "country", "postal code",
+
+    # Government IDs
+    "social security number",
+    "national id number",
+    "passport number",
+    "driver license number",
+    "tax id number",
+
+    # Financial
+    "credit card number",
+    "debit card number",
+    "bank account number",
+    "routing number",
+    "upi id",
+
+    # Account / Digital
+    "ip address",
+    "mac address",
+    "username",
+    "password",
+    "api key",
+    "session token",
+
+    # Business Identifiers
+    "order number",
+    "invoice number",
+    "employee id"
+]
