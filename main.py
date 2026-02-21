@@ -68,7 +68,7 @@ SCOPE_USER = "user"
 
 # Confidence thresholds
 CONFIDENCE_MARGIN        = 0.08   # send to LLM if margin below this (tighter — reranker widens margins)
-LOW_ABSOLUTE_SCORE       = 0.35   # top score must be strong to trust (lowered for blended score scale)
+LOW_ABSOLUTE_SCORE       = 0.45   # top score must be strong to trust (lowered for blended score scale)
 
 TOP_K                    = 100    # unchanged
 TOPK_MEAN_K              = 3     # average top-k matches per label (more robust than max)
