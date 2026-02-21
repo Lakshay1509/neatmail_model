@@ -191,7 +191,6 @@ class ClassifyResponse(BaseModel):
     margin: float
     method: str
     all_scores: dict[str, float]
-    email: Email
 
 
    
@@ -1041,11 +1040,6 @@ async def classify_email(request: ClassifyRequest):
             margin=round(margin, 4),
             method="llm_fallback+" + "+".join(method_parts),
             all_scores={k: round(v, 4) for k, v in label_scores.items()},
-            email=Email(
-                subject=cleaned_email["subject"],
-                sender=cleaned_email["sender"],
-                body=cleaned_email["body"],
-            )
             
         )
 
