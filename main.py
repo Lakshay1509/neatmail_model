@@ -28,6 +28,7 @@ import uuid
 import json
 import math
 import hashlib
+import asyncio
 from collections import defaultdict
 from datetime import datetime, timezone
 import redis
@@ -828,21 +829,31 @@ async def classify_email(request: ClassifyRequest):
 
     # ── Step 1: Validate each label exists in at least one tier ──
     missing = []
-    for label in label_names:
+    
+    def check_label(label: str) -> tuple[str, bool]:
+        # Check system tier
         in_system = pinecone_index.query(
             vector=validation_vector, top_k=1, namespace=GLOBAL_NAMESPACE,
             filter={"label": {"$eq": label}, "scope": {"$ne": SCOPE_USER}},
             include_metadata=False
         ).matches
-
+        if in_system:
+            return label, True
+            
+        # Check user tier
         in_user = pinecone_index.query(
             vector=validation_vector, top_k=1, namespace=GLOBAL_NAMESPACE,
             filter={"label": {"$eq": label}, "scope": {
                 "$eq": SCOPE_USER}, "user_id": {"$eq": user_id}},
             include_metadata=False
         ).matches
+        return label, bool(in_user)
 
-        if not in_system and not in_user:
+    check_tasks = [asyncio.to_thread(check_label, label) for label in label_names]
+    check_results = await asyncio.gather(*check_tasks)
+    
+    for label, exists in check_results:
+        if not exists:
             missing.append(label)
 
     if missing:
@@ -867,14 +878,22 @@ async def classify_email(request: ClassifyRequest):
         label: [] for label in label_names
     }
 
-    def query_and_collect(filter_dict: dict):
-        results = pinecone_index.query(
+    def query_pinecone(filter_dict: dict):
+        return pinecone_index.query(
             vector=query_vector,
             top_k=TOP_K,
             namespace=GLOBAL_NAMESPACE,
             filter={**filter_dict, "label": {"$in": label_names}},
             include_metadata=True
         )
+
+    # Run queries concurrently
+    system_task = asyncio.to_thread(query_pinecone, {"scope": {"$ne": SCOPE_USER}})
+    user_task = asyncio.to_thread(query_pinecone, {"scope": {"$eq": SCOPE_USER}, "user_id": {"$eq": user_id}})
+    
+    system_results, user_results = await asyncio.gather(system_task, user_task)
+
+    for results in (system_results, user_results):
         for match in results.matches:
             lbl = match.metadata["label"]
             if lbl in label_hits:
@@ -882,13 +901,6 @@ async def classify_email(request: ClassifyRequest):
                 proto = match.metadata.get("prototype", "")
                 if proto:
                     label_prototypes[lbl].append((match.score, proto))
-
-    # System tier — catches legacy vectors (no scope field) and scope="system"
-    query_and_collect({"scope": {"$ne": SCOPE_USER}})
-
-    # User tier — only this user's custom vectors
-    query_and_collect({"scope": {"$eq": SCOPE_USER},
-                      "user_id": {"$eq": user_id}})
 
     # Top-k mean: average the best k matches per label
     embedding_scores: dict[str, float] = {}
