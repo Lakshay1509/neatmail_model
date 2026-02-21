@@ -760,9 +760,6 @@ async def add_user_label(request: AddUserLabelRequest):
         "status":            "ok",
         "label":             label_name,
         "user_id":           user_id,
-        "scope":             SCOPE_USER,
-        "prototypes_stored": len(vectors),
-        "prototypes":        prototypes
     }
 
 
