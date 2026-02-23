@@ -301,9 +301,11 @@ def rerank_top_labels(
     for lbl in top_labels:
         protos = label_prototypes.get(lbl, [])
         if protos:
-            best_proto = max(protos, key=lambda x: x[0])[1]
-            pairs.append((email_text, best_proto))
-            pair_labels.append(lbl)
+            # Instead of 1 best prototype, cross-encode top-3 and take max
+            top_protos = sorted(protos, key=lambda x: x[0], reverse=True)[:3]
+            for proto_score, proto_text in top_protos:
+                pairs.append((email_text, proto_text))
+                pair_labels.append(lbl)
 
     if not pairs:
         return dict(embedding_scores)
@@ -879,10 +881,13 @@ async def classify_email(request: ClassifyRequest):
         )
 
     # ── Step 2: Embed the email ───────────────────────────────────
+    body = request.body
+    third = len(body) // 3
+
     body_snippet = (
-        request.body[:300] + " ... " + request.body[-200:]
-        if len(request.body) > 500
-        else request.body
+        body[:200] + " ... " + body[third:third+200] + " ... " + body[-200:]
+        if len(body) > 500
+        else body
     )
 
     email_text = f"Subject: {request.subject}\nSender: {request.sender}\nBody: {body_snippet}"
