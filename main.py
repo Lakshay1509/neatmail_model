@@ -85,6 +85,11 @@ RERANKER_BLEND_WEIGHT    = 0.40   # cross-encoder vs embedding weight for rerank
 # Structural feature prior boost (zero-ML)
 STRUCTURAL_BOOST_WEIGHT  = 0.10   # blend weight for structural signal prior
 
+# User label priority — user-defined labels get a score multiplier so they aren't
+# drowned out by system labels with many more prototypes.
+# e.g. user's "Payments" label beats system "Automated alerts" when appropriate.
+USER_LABEL_PRIORITY_BOOST = 1.30  # multiply embedding score for user-scoped labels
+
 # Sender reputation (global Bayesian-smoothed, collaborative filtering)
 REPUTATION_PRIOR_STRENGTH = 10.0  # Bayesian pseudo-count for smoothing
 REPUTATION_MIN_OBSERVATIONS = 30  # observations needed for full confidence
@@ -847,8 +852,16 @@ async def classify_email(request: ClassifyRequest):
 
     # ── Step 1: Validate each label exists in at least one tier ──
     missing = []
-    
-    def check_label(label: str) -> tuple[str, bool]:
+    user_scoped_labels: set[str] = set()   # labels that are user-defined for this user
+
+    def check_label(label: str) -> tuple[str, bool, str]:
+        """
+        Returns (label, exists, scope) where scope is SCOPE_SYSTEM or SCOPE_USER.
+        System tier is checked first; if found there the label is treated as system
+        even if the user also has a copy.  Only labels that exist EXCLUSIVELY in the
+        user tier (i.e. not in the system tier) are marked as user-scoped — this is
+        what gives them the priority boost.
+        """
         # Check system tier
         in_system = pinecone_index.query(
             vector=validation_vector, top_k=1, namespace=GLOBAL_NAMESPACE,
@@ -856,8 +869,8 @@ async def classify_email(request: ClassifyRequest):
             include_metadata=False
         ).matches
         if in_system:
-            return label, True
-            
+            return label, True, SCOPE_SYSTEM
+
         # Check user tier
         in_user = pinecone_index.query(
             vector=validation_vector, top_k=1, namespace=GLOBAL_NAMESPACE,
@@ -865,14 +878,16 @@ async def classify_email(request: ClassifyRequest):
                 "$eq": SCOPE_USER}, "user_id": {"$eq": user_id}},
             include_metadata=False
         ).matches
-        return label, bool(in_user)
+        return label, bool(in_user), SCOPE_USER if in_user else ""
 
     check_tasks = [asyncio.to_thread(check_label, label) for label in label_names]
     check_results = await asyncio.gather(*check_tasks)
-    
-    for label, exists in check_results:
+
+    for label, exists, scope in check_results:
         if not exists:
             missing.append(label)
+        elif scope == SCOPE_USER:
+            user_scoped_labels.add(label)
 
     if missing:
         raise HTTPException(
@@ -931,6 +946,15 @@ async def classify_email(request: ClassifyRequest):
         else:
             top_k_scores = sorted(scores, reverse=True)[:TOPK_MEAN_K]
             embedding_scores[label] = sum(top_k_scores) / len(top_k_scores)
+
+    # User-label priority boost — user-defined labels are boosted so they aren't
+    # outcompeted purely because system labels have more prototypes.
+    # A user adding "Payments" explicitly signals it should win over "Automated alerts".
+    for label in user_scoped_labels:
+        if label in embedding_scores:
+            embedding_scores[label] = min(
+                embedding_scores[label] * USER_LABEL_PRIORITY_BOOST, 1.0
+            )
 
     # ── Step 4: Structural feature extraction ─────────────────────
     structural_signals = extract_structural_signals(
