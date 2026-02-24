@@ -125,8 +125,7 @@ async def lifespan(app: FastAPI):
         print("Loading cross-encoder reranker...")
         reranker_model = CrossEncoder(RERANKER_MODEL_NAME)
 
-        print("Loading PII model")
-        pii_model = GLiNER.from_pretrained(PII_MODEL)
+        pii_model = None  # loaded lazily on first use to avoid startup RAM spike
 
         print("Connecting to Pinecone...")
         pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -537,6 +536,11 @@ def clean_email_for_storage(subject: str, sender: str, body: str, return_structu
     """
     full_text = f"Subject: {subject}\nSender: {sender}\nBody: {body[:500]}"
 
+
+    global pii_model
+    if pii_model is None:
+        print("Loading PII model (lazy)...")
+        pii_model = GLiNER.from_pretrained(PII_MODEL)
 
     entities = pii_model.predict_entities(full_text, PII_LABELS, threshold=0.4)
 
