@@ -29,7 +29,6 @@ import json
 import math
 import hashlib
 import asyncio
-from collections import defaultdict
 from datetime import datetime, timezone
 import redis
 from typing import Optional
@@ -485,17 +484,16 @@ def llm_classify(subject: str, sender: str, body: str, label_names: list[str]) -
 
     prompt = f"""
 You are an email classification system.
-ALLOWED CATEGORIES (case-sensitive, exact match required):
+
+ALLOWED CATEGORIES (case-sensitive, must match exactly one):
 {labels_str}
 
-CLASSIFICATION RULES (apply in order, highest priority first):
-1. FINANCE/PAYMENT: If email contains transactions, payments, UPI, bank alerts, invoices, money (₹/$) → use "Finance" if available, else use "Automated alerts" as fallback
-2. DOMAIN-SPECIFIC: Match sender domain to category (bank → Finance/Automated alerts, calendar → Event update)
-3. SEMANTIC CONTEXT: Analyze PURPOSE, not keywords
-   - Financial transactions → Finance (or Automated alerts if Finance unavailable)
-   - Calendar invites → Event update
-   - Marketing → Marketing
-4. KEYWORD MATCHING: Use for unclear cases
+Instructions:
+- Carefully analyze the email content and determine its primary purpose and context.
+- Select exactly ONE category from the allowed list.
+- Do NOT create new categories.
+- Do NOT modify category names.
+- Return ONLY the category name as the final output.
 
 
 Email:
