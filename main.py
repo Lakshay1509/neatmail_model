@@ -488,46 +488,68 @@ def llm_classify(subject: str, sender: str, body: str, label_names: list[str]) -
     Returns (label, confidence) — confidence is used to decide whether
     to store the result back into Pinecone as a learned example.
     """
-    labels_str = "\n".join(f"- {name}" for name in label_names)
+    labels_str = "\n- ".join(label_names)
 
-    prompt = f"""
-You are an email classification system.
+    system_prompt = f"""You are an email classification system. Your ONLY job is to return a valid JSON object with "label" and "confidence" fields.
 
-ALLOWED CATEGORIES (case-sensitive, must match exactly one):
-{labels_str}
+ALLOWED CATEGORIES (case-sensitive, exact match required):
+- {labels_str}
 
-Instructions:
-- Carefully analyze the email content and determine its primary purpose and context.
-- Select exactly ONE category from the allowed list.
-- Do NOT create new categories.
-- Do NOT modify category names.
-- Return ONLY the category name as the final output.
+CLASSIFICATION RULES (apply in order, highest priority first):
+1. FINANCE/PAYMENT: If email contains transactions, payments, UPI, bank alerts, invoices, money (₹/$) → use "Finance" if available, else use "Automated alerts" as fallback
+2. DOMAIN-SPECIFIC: Match sender domain to category (bank → Finance/Automated alerts, calendar → Event update)
+3. SEMANTIC CONTEXT: Analyze PURPOSE, not keywords
+   - Financial transactions → Finance (or Automated alerts if Finance unavailable)
+   - Calendar invites → Event update
+   - Marketing → Marketing
+4. KEYWORD MATCHING: Use for unclear cases
+5. CONFIDENCE: If < 85% confidence → return empty string for label
 
+OUTPUT FORMAT (strict):
+{{"label": "exact_category_name", "confidence": 0.95}}
+OR if uncertain:
+{{"label": "", "confidence": 0.0}}
 
-Email:
+EXAMPLES:
+Input: Subject="You have done a UPI txn", From="HDFC Bank", Body="Rs.110.00 has been debited"
+Output: {{"label": "Finance", "confidence": 0.99}}
+Input: Subject="Server CPU usage at 90%", From="monitoring@company.com"
+Output: {{"label": "Automated alerts", "confidence": 0.97}}
+Input: Subject="Meeting Tomorrow", From="calendar@zoom.us"
+Output: {{"label": "Event update", "confidence": 0.98}}
+Input: Subject="Your monthly invoice", Body="Payment of $99 is due"
+Output: {{"label": "Finance", "confidence": 0.96}}"""
+
+    user_prompt = f"""Classify this email into ONE category or return empty label if uncertain:
+
 Subject: {subject}
-Sender: {sender}
+From: {sender}
 Body: {body[:1000]}
 
-Return ONLY a JSON object with two fields:
-- "label": the category name (must be one of the options above)
-- "confidence": your confidence score as a float between 0.0 and 1.0
-
-Format: {{"label": "Marketing", "confidence": 0.95}}
-"""
+Available categories:
+- {labels_str}"""
 
     response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
         response_format={"type": "json_object"},
-        temperature=0
+        temperature=0,
+        max_tokens=20,
+        seed=42,
     )
 
-    parsed = json.loads(response.choices[0].message.content)
+    content = response.choices[0].message.content
+    if not content:
+        raise ValueError("No response from OpenAI")
+
+    parsed = json.loads(content)
     predicted = parsed.get("label", "").strip()
     llm_confidence = float(parsed.get("confidence", 0.0))
 
-    # Match back to known label names (handles extra punctuation from LLM)
+    # Match back to known label names (handles minor LLM deviations)
     for name in label_names:
         if name.lower() in predicted.lower():
             return name, llm_confidence
