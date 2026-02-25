@@ -350,19 +350,27 @@ def extract_domain(sender: str) -> str:
     return match.group(1).lower() if match else ""
 
 
-def update_sender_affinity(domain: str, label: str, user_id: str):
+def update_sender_affinity(domain: str, label: str, user_id: str, is_user_label: bool = False):
     """
     Record a classification result in Redis.
     Updates global counts, per-user counts, AND the unique-user set
     for this domain-label pair (powers the sender reputation graph).
+
+    is_user_label=True: the winning label is a user-custom label.
+    In that case we skip the global affinity:sys update so that this
+    user's personal vocabulary doesn't pollute the shared reputation
+    signal seen by other users (who don't have that custom label).
     """
     if not domain or not redis_client:
         return
     pipe = redis_client.pipeline(transaction=False)
-    pipe.hincrby(f"affinity:sys:{domain}", label, 1)
+    if not is_user_label:
+        # Only record in global reputation when the label is a system label.
+        # User-custom label wins must not teach other users' classifiers.
+        pipe.hincrby(f"affinity:sys:{domain}", label, 1)
+        pipe.sadd(f"rep:users:{domain}:{label}", user_id)   # unique user tracking
     pipe.hincrby(f"affinity:u:{user_id}:{domain}", label, 1)
-    pipe.sadd(f"rep:users:{domain}:{label}", user_id)   # unique user tracking
-    pipe.execute()  
+    pipe.execute()
 
 
 def get_sender_affinity_scores(
@@ -973,6 +981,18 @@ async def classify_email(request: ClassifyRequest):
     affinity_scores = get_sender_affinity_scores(domain, user_id, label_names)
     has_affinity = any(v > 0 for v in affinity_scores.values())
 
+    # ── Guard: protect custom labels from cross-user reputation pollution ─────
+    # Reputation is built by users who may NOT have this user's custom labels.
+    # Their fallback votes for system labels (e.g. "action needed") must not
+    # override an explicit custom label intent (e.g. "university").
+    # When the user has any user-scoped label, zero out reputation for all
+    # system labels — the crowd signal is irrelevant for this user's taxonomy.
+    if user_scoped_labels:
+        for lbl in label_names:
+            if lbl not in user_scoped_labels:
+                reputation_scores[lbl] = 0.0
+        has_reputation = any(v > 0 for v in reputation_scores.values())
+
     # ── Step 6: Blend all signals ─────────────────────────────────
     # Dynamic weight allocation: when a signal is inactive, its weight
     # is redistributed proportionally to the active signals.
@@ -1064,7 +1084,7 @@ async def classify_email(request: ClassifyRequest):
             print(
                 f"⚠️  LLM confidence too low ({llm_confidence:.2f}) — skipping storage")
 
-        update_sender_affinity(domain, llm_label, user_id)
+        update_sender_affinity(domain, llm_label, user_id, is_user_label=(llm_label in user_scoped_labels))
         return ClassifyResponse(
             label=llm_label,
             confidence=round(top_score, 4),
@@ -1074,7 +1094,7 @@ async def classify_email(request: ClassifyRequest):
             
         )
 
-    update_sender_affinity(domain, top_label, user_id)
+    update_sender_affinity(domain, top_label, user_id, is_user_label=(top_label in user_scoped_labels))
     return ClassifyResponse(
         label=top_label,
         confidence=round(top_score, 4),
