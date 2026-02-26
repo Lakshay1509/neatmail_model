@@ -67,7 +67,7 @@ SCOPE_SYSTEM = "system"
 SCOPE_USER = "user"
 
 # Confidence thresholds
-CONFIDENCE_MARGIN        = 0.08   # send to LLM if margin below this (tighter — reranker widens margins)
+CONFIDENCE_MARGIN        = 0.12   # send to LLM if margin below this (wider — let LLM arbitrate close calls)
 LOW_ABSOLUTE_SCORE       = 0.45   # top score must be strong to trust (lowered for blended score scale)
 
 TOP_K                    = 100    # unchanged
@@ -79,15 +79,21 @@ SENDER_AFFINITY_WEIGHT   = 0.08   # blend weight for per-user sender affinity (r
 # Cross-encoder reranker
 RERANKER_MODEL_NAME      = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 RERANKER_TOP_N           = 5      # rerank top-N label candidates
-RERANKER_BLEND_WEIGHT    = 0.40   # cross-encoder vs embedding weight for reranked labels (reduced to preserve score magnitude)
+RERANKER_BLEND_WEIGHT    = 0.30   # cross-encoder vs embedding weight (reduced — preserve user-label signals)
 
 # Structural feature prior boost (zero-ML)
-STRUCTURAL_BOOST_WEIGHT  = 0.10   # blend weight for structural signal prior
+STRUCTURAL_BOOST_WEIGHT  = 0.25   # blend weight for structural signal prior (raised — strong zero-ML signal)
 
 # User label priority — user-defined labels get a score multiplier so they aren't
 # drowned out by system labels with many more prototypes.
 # e.g. user's "Payments" label beats system "Automated alerts" when appropriate.
-USER_LABEL_PRIORITY_BOOST = 1.30  # multiply embedding score for user-scoped labels
+USER_LABEL_PRIORITY_BOOST = 1.50  # multiply final score for user-scoped labels (applied post-rerank)
+
+# Structural signal amplification for user-custom labels
+USER_STRUCTURAL_AMPLIFIER = 1.5   # multiply structural boost when it matches a user-custom label
+
+# User-label conflict — force LLM when user-custom label competes with system label
+USER_LABEL_CONFLICT_MARGIN = 0.15 # force LLM if user-label is within this margin of top
 
 # Sender reputation (global Bayesian-smoothed, collaborative filtering)
 REPUTATION_PRIOR_STRENGTH = 10.0  # Bayesian pseudo-count for smoothing
@@ -319,9 +325,15 @@ def rerank_top_labels(
     # Sigmoid to [0, 1]
     sigmoid_scores = [1.0 / (1.0 + math.exp(-float(s))) for s in raw_scores]
 
-    # Blend with embedding scores for reranked labels
-    updated = dict(embedding_scores)
+    # Aggregate cross-encoder scores per label (take max across prototypes)
+    ce_per_label: dict[str, float] = {}
     for lbl, ce_score in zip(pair_labels, sigmoid_scores):
+        if lbl not in ce_per_label or ce_score > ce_per_label[lbl]:
+            ce_per_label[lbl] = ce_score
+
+    # Blend with original scores for reranked labels
+    updated = dict(embedding_scores)
+    for lbl, ce_score in ce_per_label.items():
         updated[lbl] = (
             RERANKER_BLEND_WEIGHT * ce_score
             + (1 - RERANKER_BLEND_WEIGHT) * embedding_scores[lbl]
@@ -495,30 +507,23 @@ def llm_classify(subject: str, sender: str, body: str, label_names: list[str]) -
 ALLOWED CATEGORIES (case-sensitive, exact match required):
 - {labels_str}
 
-CLASSIFICATION RULES (apply in order, highest priority first):
-1. FINANCE/PAYMENT: If email contains transactions, payments, UPI, bank alerts, invoices, money (₹/$) → use "Finance" if available, else use "Automated alerts" as fallback
-2. DOMAIN-SPECIFIC: Match sender domain to category (bank → Finance/Automated alerts, calendar → Event update)
-3. SEMANTIC CONTEXT: Analyze PURPOSE, not keywords
-   - Financial transactions → Finance (or Automated alerts if Finance unavailable)
-   - Calendar invites → Event update
-   - Marketing → Marketing
-4. KEYWORD MATCHING: Use for unclear cases
-5. CONFIDENCE: If < 85% confidence → return empty string for label
+RULES (highest priority first):
+1. SPECIFICITY: Always prefer the MOST SPECIFIC matching category.
+   - If "Payments" exists, use it for payment/transaction emails instead of generic "Automated alerts"
+   - If "Orders" exists, use it for shipping/delivery emails instead of "Updates"
+   - Specific user-defined labels ALWAYS beat generic catch-all labels
+2. PURPOSE: Classify by the email's PRIMARY PURPOSE, not surface keywords:
+   - Payment/transaction/invoice/billing/UPI/debit/credit → payment-related category
+   - Calendar/meeting/RSVP/invite → event-related category
+   - Marketing/promotions/deals/offers → marketing-related category
+   - System notifications with no specific purpose → alerts/notification category
+3. DOMAIN: Match sender domain patterns to category purpose
+4. CONFIDENCE: If < 85% confident → return empty string for label
 
-OUTPUT FORMAT (strict):
+OUTPUT FORMAT (strict JSON):
 {{"label": "exact_category_name", "confidence": 0.95}}
 OR if uncertain:
-{{"label": "", "confidence": 0.0}}
-
-EXAMPLES:
-Input: Subject="You have done a UPI txn", From="HDFC Bank", Body="Rs.110.00 has been debited"
-Output: {{"label": "Finance", "confidence": 0.99}}
-Input: Subject="Server CPU usage at 90%", From="monitoring@company.com"
-Output: {{"label": "Automated alerts", "confidence": 0.97}}
-Input: Subject="Meeting Tomorrow", From="calendar@zoom.us"
-Output: {{"label": "Event update", "confidence": 0.98}}
-Input: Subject="Your monthly invoice", Body="Payment of $99 is due"
-Output: {{"label": "Finance", "confidence": 0.96}}"""
+{{"label": "", "confidence": 0.0}}"""
 
     user_prompt = f"""Classify this email into ONE category or return empty label if uncertain:
 
@@ -537,7 +542,7 @@ Available categories:
         ],
         response_format={"type": "json_object"},
         temperature=0,
-        max_tokens=20,
+        max_tokens=50,
         seed=42,
     )
 
@@ -979,20 +984,20 @@ async def classify_email(request: ClassifyRequest):
             top_k_scores = sorted(scores, reverse=True)[:TOPK_MEAN_K]
             embedding_scores[label] = sum(top_k_scores) / len(top_k_scores)
 
-    # User-label priority boost — user-defined labels are boosted so they aren't
-    # outcompeted purely because system labels have more prototypes.
-    # A user adding "Payments" explicitly signals it should win over "Automated alerts".
-    for label in user_scoped_labels:
-        if label in embedding_scores:
-            embedding_scores[label] = min(
-                embedding_scores[label] * USER_LABEL_PRIORITY_BOOST, 1.0
-            )
+    # (User-label priority boost applied post-rerank — see Step 7.5)
 
     # ── Step 4: Structural feature extraction ─────────────────────
     structural_signals = extract_structural_signals(
         request.subject, request.sender, request.body
     )
     structural_boost = compute_structural_boost(structural_signals, label_names)
+
+    # Amplify structural boost for user-custom labels — the user explicitly
+    # created this label AND the email has structural evidence for it.
+    for lbl in user_scoped_labels:
+        if lbl in structural_boost and structural_boost[lbl] > 0:
+            structural_boost[lbl] = min(structural_boost[lbl] * USER_STRUCTURAL_AMPLIFIER, 1.0)
+
     has_structural = any(v > 0 for v in structural_boost.values())
 
     # ── Step 5: Sender reputation + per-user affinity ─────────────
@@ -1045,6 +1050,15 @@ async def classify_email(request: ClassifyRequest):
         email_text, label_prototypes, label_scores
     )
 
+    # ── Step 7.5: User-label priority boost (post-rerank) ────────
+    # Applied AFTER reranking so the cross-encoder can't undo it.
+    # User creating a custom label is an explicit signal of intent.
+    for label in user_scoped_labels:
+        if label in label_scores:
+            label_scores[label] = min(
+                label_scores[label] * USER_LABEL_PRIORITY_BOOST, 1.0
+            )
+
     # ── Step 8: Rank and check confidence ────────────────────────
     sorted_labels = sorted(label_scores.items(),
                            key=lambda x: x[1], reverse=True)
@@ -1052,8 +1066,20 @@ async def classify_email(request: ClassifyRequest):
     second_score = sorted_labels[1][1] if len(sorted_labels) > 1 else 0.0
     margin = top_score - second_score
 
+    # Force LLM when a user-custom label competes with a system label.
+    # The embedding model can't understand user intent; the LLM can arbitrate.
+    user_label_conflict = False
+    if user_scoped_labels and len(sorted_labels) >= 2:
+        top_lbl = sorted_labels[0][0]
+        second_lbl = sorted_labels[1][0]
+        # If system label won but user-label is close behind (or vice versa)
+        if ((top_lbl not in user_scoped_labels and second_lbl in user_scoped_labels) or
+            (top_lbl in user_scoped_labels and second_lbl not in user_scoped_labels)):
+            if margin < USER_LABEL_CONFLICT_MARGIN:
+                user_label_conflict = True
+
     use_llm = ((margin < CONFIDENCE_MARGIN) or (
-        top_score < LOW_ABSOLUTE_SCORE)) and request.use_llm
+        top_score < LOW_ABSOLUTE_SCORE) or user_label_conflict) and request.use_llm
 
     # Build method string showing which signals contributed
     method_parts = ["embedding"]
@@ -1064,6 +1090,8 @@ async def classify_email(request: ClassifyRequest):
     if has_affinity:
         method_parts.append("affinity")
     method_parts.append("reranker")
+    if user_label_conflict:
+        method_parts.append("user_conflict")
 
     # ── Step 9: LLM fallback if needed ───────────────────────────
     if use_llm:
