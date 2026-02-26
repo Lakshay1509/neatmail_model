@@ -19,7 +19,7 @@ image = (
         "python -c \""
         "from sentence_transformers import SentenceTransformer, CrossEncoder; "
         "SentenceTransformer('Qwen/Qwen3-Embedding-0.6B'); "
-        "CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
+        "CrossEncoder('cross-encoder/nli-MiniLM2-L6-H768')"
         "\""
     )
     .add_local_python_source("main")
@@ -48,7 +48,7 @@ class EmailClassifier:
         self.embedding_model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
         self.embedding_model.encode("warmup", normalize_embeddings=True)
         print("Loading cross-encoder reranker...")
-        self.reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        self.reranker_model = CrossEncoder("cross-encoder/nli-MiniLM2-L6-H768")
         self.reranker_model.predict([("warmup query", "warmup document")])
         print("Models ready.")
 

@@ -1,7 +1,7 @@
 """
 Email Classifier API
 Stack: FastAPI + Pinecone (v3) + Qwen3-Embedding-0.6B
-     + cross-encoder/ms-marco-MiniLM-L-6-v2 (reranker)
+     + cross-encoder/nli-MiniLM2-L6-H768 (reranker)
      + GPT-4o-mini fallback
 
 Classification pipeline:
@@ -77,7 +77,7 @@ LLM_CONFIDENCE_THRESHOLD = 0.80   # accept slightly less confident LLM results
 SENDER_AFFINITY_WEIGHT   = 0.08   # blend weight for per-user sender affinity (reduced; reputation takes rest)
 
 # Cross-encoder reranker
-RERANKER_MODEL_NAME      = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANKER_MODEL_NAME      = "cross-encoder/nli-MiniLM2-L6-H768"
 RERANKER_TOP_N           = 5      # rerank top-N label candidates
 RERANKER_BLEND_WEIGHT    = 0.30   # cross-encoder vs embedding weight (reduced — preserve user-label signals)
 
@@ -320,10 +320,19 @@ def rerank_top_labels(
         return dict(embedding_scores)
 
     # Batch cross-encode — single forward pass
-    raw_scores = reranker_model.predict(pairs)
+    # nli-MiniLM2-L6-H768 outputs 3 logits per pair:
+    #   [contradiction, neutral, entailment]
+    # We apply softmax and take the entailment probability as relevance score.
+    raw_scores = reranker_model.predict(pairs, apply_softmax=False)
 
-    # Sigmoid to [0, 1]
-    sigmoid_scores = [1.0 / (1.0 + math.exp(-float(s))) for s in raw_scores]
+    def _nli_entailment_prob(logits) -> float:
+        """Softmax over 3 NLI logits → entailment (index 2) probability."""
+        import numpy as np
+        logits = np.asarray(logits, dtype=float)
+        e = np.exp(logits - logits.max())
+        return float(e[2] / e.sum())
+
+    sigmoid_scores = [_nli_entailment_prob(s) for s in raw_scores]
 
     # Aggregate cross-encoder scores per label (take max across prototypes)
     ce_per_label: dict[str, float] = {}
