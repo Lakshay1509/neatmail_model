@@ -1067,16 +1067,10 @@ async def classify_email(request: ClassifyRequest):
 
     # ── Step 9: LLM fallback if needed ───────────────────────────
     if use_llm:
-        cleaned_email = clean_email_for_storage(
+        llm_label, llm_confidence = llm_classify(
             subject=request.subject,
             sender=request.sender,
             body=request.body,
-            return_structured=True
-        )
-        llm_label, llm_confidence = llm_classify(
-            subject=cleaned_email["subject"],
-            sender=cleaned_email["sender"],
-            body=cleaned_email["body"],
             label_names=label_names
         )
 
