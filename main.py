@@ -70,8 +70,9 @@ SCOPE_USER = "user"
 CONFIDENCE_MARGIN        = 0.12   # send to LLM if margin below this (wider — let LLM arbitrate close calls)
 LOW_ABSOLUTE_SCORE       = 0.45   # top score must be strong to trust (lowered for blended score scale)
 
-TOP_K                    = 100    # unchanged
-TOPK_MEAN_K              = 3     # average top-k matches per label (more robust than max)
+TOP_K_PER_LABEL          = 15     # vectors fetched PER LABEL (per-label querying ensures equal retrieval budget)
+TOPK_MEAN_K              = 3      # average top-k matches per label (more robust than max)
+TOP_K                    = TOP_K_PER_LABEL  # kept for delete endpoints / admin queries
 SIMILARITY_THRESHOLD     = 0.85   # store more examples (less strict dedup)
 LLM_CONFIDENCE_THRESHOLD = 0.80   # accept slightly less confident LLM results
 SENDER_AFFINITY_WEIGHT   = 0.08   # blend weight for per-user sender affinity (reduced; reputation takes rest)
@@ -954,31 +955,44 @@ async def classify_email(request: ClassifyRequest):
     email_text = f"Subject: {request.subject}\nSender: {request.sender}\nBody: {body_snippet}"
     query_vector = embed_query(email_text)
 
-    # ── Step 3: Query both tiers, collect scores + prototype texts ─
+    # ── Step 3: Per-label querying — equal retrieval budget for every label ──
+    #
+    # WHY PER-LABEL: A single global top_k pool is unfair when labels have
+    # different numbers of stored vectors. "Marketing" accumulates more learned
+    # examples over time (high email volume), so it would crowd out "Finance" or
+    # "Action Needed" in a shared top_k=100 pool. By querying each label with
+    # a fixed TOP_K_PER_LABEL budget, every label competes on a level playing field.
+    #
     label_hits: dict[str, list[float]] = {label: [] for label in label_names}
     label_prototypes: dict[str, list[tuple[float, str]]] = {
         label: [] for label in label_names
     }
 
-    def query_pinecone(filter_dict: dict):
+    def query_label(label: str, scope_filter: dict) -> list:
+        """Query Pinecone for a single label with a fixed per-label budget."""
         return pinecone_index.query(
             vector=query_vector,
-            top_k=TOP_K,
+            top_k=TOP_K_PER_LABEL,
             namespace=GLOBAL_NAMESPACE,
-            filter={**filter_dict, "label": {"$in": label_names}},
+            filter={**scope_filter, "label": {"$eq": label}},
             include_metadata=True
-        )
+        ).matches
 
-    # Run queries concurrently
-    system_task = asyncio.to_thread(query_pinecone, {"scope": {"$ne": SCOPE_USER}})
-    user_task = asyncio.to_thread(query_pinecone, {"scope": {"$eq": SCOPE_USER}, "user_id": {"$eq": user_id}})
-    
-    system_results, user_results = await asyncio.gather(system_task, user_task)
+    # Build per-label tasks for both system and user tiers — all run concurrently
+    system_filter = {"scope": {"$ne": SCOPE_USER}}
+    user_filter   = {"scope": {"$eq": SCOPE_USER}, "user_id": {"$eq": user_id}}
 
-    for results in (system_results, user_results):
-        for match in results.matches:
-            lbl = match.metadata["label"]
-            if lbl in label_hits:
+    per_label_tasks = [
+        asyncio.to_thread(query_label, lbl, scope_filter)
+        for lbl in label_names
+        for scope_filter in (system_filter, user_filter)
+    ]
+    per_label_results = await asyncio.gather(*per_label_tasks)
+
+    # Interleave results: [lbl0_sys, lbl0_user, lbl1_sys, lbl1_user, ...]
+    for i, lbl in enumerate(label_names):
+        for matches in per_label_results[i * 2 : i * 2 + 2]:   # sys + user pair
+            for match in matches:
                 label_hits[lbl].append(match.score)
                 proto = match.metadata.get("prototype", "")
                 if proto:
