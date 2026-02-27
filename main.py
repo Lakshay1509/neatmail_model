@@ -35,7 +35,7 @@ from typing import Optional
 from contextlib import asynccontextmanager
 import uvicorn
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from pinecone import Pinecone
@@ -57,6 +57,7 @@ PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
 PINECONE_INDEX = os.environ["PINECONE_INDEX_NAME"]   # dim=1024, metric=cosine
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 UPSTASH_REDIS_URL = os.environ.get("UPSTASH_REDIS_URL", "")  # redis://...:port
+API_SECRET_KEY = os.environ["API_SECRET_KEY"]         # shared secret from backend
 
 GLOBAL_NAMESPACE = "labels"
 PROTOTYPES_PER_LABEL = 10
@@ -102,6 +103,24 @@ SENDER_REPUTATION_WEIGHT = 0.12   # blend weight for global reputation
 
 
 QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belongs to.\nQuery: "
+
+
+# ─────────────────────────────────────────────
+# Auth dependency
+# ─────────────────────────────────────────────
+
+async def verify_api_key(authorization: str = Header(...)):
+    """
+    Validates the Authorization header on every request.
+    Expected format: Bearer <API_SECRET_KEY>
+    """
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or token != API_SECRET_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 
@@ -154,7 +173,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Email Classifier API",
     description="Hybrid embedding + LLM email classifier with system + per-user label tiers.",
-    lifespan=lifespan
+    lifespan=lifespan,
+    dependencies=[Depends(verify_api_key)]
 )
 
 
