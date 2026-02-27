@@ -570,18 +570,6 @@ Available categories:
 
 
 def clean_email_for_storage(subject: str, sender: str, body: str, return_structured: bool = False) -> str | dict:
-    """
-    Produce a privacy-safe, semantically rich email representation for Pinecone.
-
-    GPT-4o-mini acts as a single-step anonymizer:
-      - Detects and replaces all PII (names, emails, URLs, phone numbers, etc.)
-        with natural, role-based descriptions (e.g. "a colleague", "an invoice link").
-      - Preserves tone, urgency, formality, topic, and intent so that the stored
-        embedding captures the email's real category signal.
-
-    On failure (network / quota) the raw truncated text is stored as a fallback
-    so the feedback loop never hard-crashes.
-    """
     raw_text = f"Subject: {subject}\nSender: {sender}\nBody: {body[:500]}"
 
     anonymize_prompt = f"""You are an email anonymizer preparing training data for an email classifier.
@@ -591,15 +579,18 @@ Your task:
   phone numbers, account numbers, company names, physical addresses) with natural,
   role-based descriptions that preserve context.
   Good replacement examples:
-    Person name      → "a colleague", "a client", "the support agent", "a vendor"
-    URL / link       → "a product link", "a tracking URL", "a login link", "an invoice link"
-    Email address    → "their email address"
-    Phone number     → "their contact number"
-    Company name     → "the company", "the service provider", "the sender's organization"
+    Person name  → "a colleague", "a client", "the support agent", "a vendor"
+    URL / link   → "a product link", "a tracking URL", "a login link", "an invoice link"
+    Email        → "their email address"
+    Phone        → "their contact number"
+    Company      → "the company", "the service provider", "the sender's organization"
 - Preserve EXACTLY: tone, urgency, formality level, topic/category, and intent.
 - Do NOT summarize, shorten, or add new information.
-- Keep the Subject / Sender / Body structure intact.
-- Output ONLY the rewritten email — nothing else.
+
+Return a JSON object with exactly these three keys:
+  "subject" - anonymized subject line
+  "sender"  - anonymized sender description
+  "body"    - anonymized body text
 
 Email:
 {raw_text}"""
@@ -610,22 +601,28 @@ Email:
             messages=[{"role": "user", "content": anonymize_prompt}],
             temperature=0.2,
             max_tokens=400,
+            response_format={"type": "json_object"},  # ← guarantees valid JSON
         )
-        cleaned = response.choices[0].message.content.strip()
+        data = json.loads(response.choices[0].message.content)
+        parsed = {
+            "subject": data.get("subject", ""),
+            "sender":  data.get("sender",  ""),
+            "body":    data.get("body",    ""),
+        }
     except Exception as e:
         print(f"⚠️  LLM anonymization failed, storing raw truncated text: {e}")
-        cleaned = raw_text
+        # Fallback: best-effort split so the shape is always consistent
+        lines = raw_text.split("\n", 2)
+        parsed = {
+            "subject": lines[0].removeprefix("Subject: ").strip(),
+            "sender":  lines[1].removeprefix("Sender: ").strip()  if len(lines) > 1 else "",
+            "body":    lines[2].removeprefix("Body: ").strip()    if len(lines) > 2 else "",
+        }
 
-    if not return_structured:
-        return cleaned
+    if return_structured:
+        return parsed
 
-    # Parse back into subject, sender, body
-    lines = cleaned.split("\n", 2)
-    return {
-        "subject": lines[0].removeprefix("Subject: ").strip() if len(lines) > 0 else "",
-        "sender":  lines[1].removeprefix("Sender: ").strip()  if len(lines) > 1 else "",
-        "body":    lines[2].removeprefix("Body: ").strip()    if len(lines) > 2 else "",
-    }
+    return f"Subject: {parsed['subject']}\nSender: {parsed['sender']}\nBody: {parsed['body']}"
 
 
 def is_already_covered(vector: list[float], label: str, extra_filter: dict) -> bool:
