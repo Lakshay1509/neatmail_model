@@ -40,8 +40,7 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from pinecone import Pinecone
 from openai import OpenAI
-from structural_patterns import STRUCTURAL_PATTERNS, SIGNAL_TO_CATEGORY, CATEGORY_KEYWORDS, PII_LABELS
-from gliner import GLiNER
+from structural_patterns import STRUCTURAL_PATTERNS, SIGNAL_TO_CATEGORY, CATEGORY_KEYWORDS
 
 # Only load .env locally, not on Modal
 import os
@@ -101,8 +100,6 @@ REPUTATION_PRIOR_STRENGTH = 10.0  # Bayesian pseudo-count for smoothing
 REPUTATION_MIN_OBSERVATIONS = 30  # observations needed for full confidence
 SENDER_REPUTATION_WEIGHT = 0.12   # blend weight for global reputation
 
-#PII model
-PII_MODEL="urchade/gliner_small-v2.1"
 
 QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belongs to.\nQuery: "
 
@@ -112,7 +109,7 @@ QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belong
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global embedding_model, pinecone_index, openai_client, redis_client, reranker_model, pii_model
+    global embedding_model, pinecone_index, openai_client, redis_client, reranker_model
 
     if hasattr(app.state, "embedding_model"):
         # ── Running on Modal ──────────────────────────────────────────
@@ -131,7 +128,7 @@ async def lifespan(app: FastAPI):
         print("Loading cross-encoder reranker...")
         reranker_model = CrossEncoder(RERANKER_MODEL_NAME)
 
-        pii_model = None  # loaded lazily on first use to avoid startup RAM spike
+
 
         print("Connecting to Pinecone...")
         pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -572,31 +569,55 @@ Available categories:
     return predicted, llm_confidence
 
 
-def clean_email_for_storage(subject: str, sender: str, body: str, return_structured:bool=False) -> str|dict:
+def clean_email_for_storage(subject: str, sender: str, body: str, return_structured: bool = False) -> str | dict:
     """
-    Strip personal info before storing as a learned example.
-    Keeps the pattern and intent, removes user-specific noise.
+    Produce a privacy-safe, semantically rich email representation for Pinecone.
+
+    GPT-4o-mini acts as a single-step anonymizer:
+      - Detects and replaces all PII (names, emails, URLs, phone numbers, etc.)
+        with natural, role-based descriptions (e.g. "a colleague", "an invoice link").
+      - Preserves tone, urgency, formality, topic, and intent so that the stored
+        embedding captures the email's real category signal.
+
+    On failure (network / quota) the raw truncated text is stored as a fallback
+    so the feedback loop never hard-crashes.
     """
-    full_text = f"Subject: {subject}\nSender: {sender}\nBody: {body[:500]}"
+    raw_text = f"Subject: {subject}\nSender: {sender}\nBody: {body[:500]}"
 
+    anonymize_prompt = f"""You are an email anonymizer preparing training data for an email classifier.
 
-    global pii_model
-    if pii_model is None:
-        print("Loading PII model (lazy)...")
-        pii_model = GLiNER.from_pretrained(PII_MODEL)
+Your task:
+- Identify and replace ALL personal information (full names, email addresses, URLs/links,
+  phone numbers, account numbers, company names, physical addresses) with natural,
+  role-based descriptions that preserve context.
+  Good replacement examples:
+    Person name      → "a colleague", "a client", "the support agent", "a vendor"
+    URL / link       → "a product link", "a tracking URL", "a login link", "an invoice link"
+    Email address    → "their email address"
+    Phone number     → "their contact number"
+    Company name     → "the company", "the service provider", "the sender's organization"
+- Preserve EXACTLY: tone, urgency, formality level, topic/category, and intent.
+- Do NOT summarize, shorten, or add new information.
+- Keep the Subject / Sender / Body structure intact.
+- Output ONLY the rewritten email — nothing else.
 
-    entities = pii_model.predict_entities(full_text, PII_LABELS, threshold=0.4)
+Email:
+{raw_text}"""
 
-    # Sort in reverse order so replacements don't shift character positions
-    entities = sorted(entities, key=lambda e: e["start"], reverse=True)
-
-    cleaned = full_text
-    for entity in entities:
-        placeholder = f"[{entity['label'].upper().replace(' ', '_')}]"
-        cleaned = cleaned[:entity["start"]] + placeholder + cleaned[entity["end"]:]
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": anonymize_prompt}],
+            temperature=0.2,
+            max_tokens=400,
+        )
+        cleaned = response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"⚠️  LLM anonymization failed, storing raw truncated text: {e}")
+        cleaned = raw_text
 
     if not return_structured:
-        return cleaned.strip()
+        return cleaned
 
     # Parse back into subject, sender, body
     lines = cleaned.split("\n", 2)
