@@ -27,6 +27,7 @@ import re
 import uuid
 import json
 import math
+import random
 import hashlib
 import asyncio
 from datetime import datetime, timezone
@@ -114,6 +115,18 @@ SENDER_REPUTATION_WEIGHT = 0.12   # blend weight for global reputation
 
 
 QUERY_INSTRUCTION = "Instruct: Given an email, identify which category it belongs to.\nQuery: "
+
+
+# ─────────────────────────────────────────────
+# Auto-Tuning Config
+# ─────────────────────────────────────────────
+# Hardcoded weights above are cold-start defaults. After MIN_AUTOTUNE_SAMPLES
+# LLM fallback calls, learned weights replace them automatically.
+MIN_AUTOTUNE_SAMPLES = 50           # LLM calls before trusting learned weights
+MARGIN_BUCKET_SIZE = 0.02           # granularity for margin calibration
+MARGIN_TARGET_ACCURACY = 0.90       # embedding→LLM agreement target
+MAX_RERANKER_BLEND = 0.40           # cap for learned reranker weight
+AUTOTUNE_EXPLORE_RATE = 0.05        # fraction of high-confidence cases sent to LLM for calibration
 
 
 # ─────────────────────────────────────────────
@@ -302,6 +315,7 @@ def rerank_top_labels(
     label_prototypes: dict[str, list[tuple[float, str]]],
     embedding_scores: dict[str, float],
     top_n: int = RERANKER_TOP_N,
+    blend_weight: float = RERANKER_BLEND_WEIGHT,
 ) -> dict[str, float]:
     """
     Rerank top-N labels using the cross-encoder model.
@@ -361,8 +375,8 @@ def rerank_top_labels(
     updated = dict(embedding_scores)
     for lbl, ce_score in ce_per_label.items():
         updated[lbl] = (
-            RERANKER_BLEND_WEIGHT * ce_score
-            + (1 - RERANKER_BLEND_WEIGHT) * embedding_scores[lbl]
+            blend_weight * ce_score
+            + (1 - blend_weight) * embedding_scores[lbl]
         )
 
     return updated
@@ -477,6 +491,227 @@ def get_sender_reputation_scores(
     confidence = min(1.0, total / REPUTATION_MIN_OBSERVATIONS)
 
     return {lbl: s * confidence for lbl, s in smoothed.items()}
+
+
+# ─────────────────────────────────────────────
+# Auto-Tuning  (Redis-backed, LLM-as-oracle)
+# ─────────────────────────────────────────────
+# Every LLM fallback provides a ground-truth label. We track how often
+# each signal's top-1 prediction matched the LLM's answer, then use
+# those accuracy rates as blend weights — replacing manual guessing.
+#
+# Redis keys:
+#   autotune:signal:{name}   → hash {correct: N, total: M}
+#   autotune:reranker        → hash {helped: N, hurt: M, neutral: P}
+#   autotune:margin:{bucket} → hash {agreed: N, total: M}
+#
+# Cold start: hardcoded defaults used until MIN_AUTOTUNE_SAMPLES reached.
+
+
+def _signal_top_label(scores: dict[str, float]) -> str:
+    """Return the label with highest score, or '' if all zero."""
+    if not scores:
+        return ""
+    top_lbl, top_val = max(scores.items(), key=lambda x: x[1])
+    return top_lbl if top_val > 0 else ""
+
+
+def record_autotune_signals(
+    llm_label: str,
+    embedding_scores: dict[str, float],
+    structural_boost: dict[str, float],
+    reputation_scores: dict[str, float],
+    affinity_scores: dict[str, float],
+    pre_rerank_top: str,
+    post_rerank_top: str,
+    margin: float,
+    has_structural: bool,
+    has_reputation: bool,
+    has_affinity: bool,
+):
+    """
+    Record per-signal accuracy after every LLM fallback call.
+    This is the core data collection that powers auto-tuning.
+    ~8 Redis commands per call (pipelined → 1 round-trip).
+    """
+    if not redis_client or not llm_label:
+        return
+
+    pipe = redis_client.pipeline(transaction=False)
+
+    # ── Per-signal accuracy ──────────────────────────────────────
+    signal_tops = {"embedding": _signal_top_label(embedding_scores)}
+    if has_structural:
+        signal_tops["structural"] = _signal_top_label(structural_boost)
+    if has_reputation:
+        signal_tops["reputation"] = _signal_top_label(reputation_scores)
+    if has_affinity:
+        signal_tops["affinity"] = _signal_top_label(affinity_scores)
+
+    for sig_name, sig_top in signal_tops.items():
+        key = f"autotune:signal:{sig_name}"
+        pipe.hincrby(key, "total", 1)
+        if sig_top == llm_label:
+            pipe.hincrby(key, "correct", 1)
+
+    # ── Reranker delta (helped / hurt / neutral) ─────────────────
+    if pre_rerank_top != post_rerank_top:
+        if post_rerank_top == llm_label:
+            pipe.hincrby("autotune:reranker", "helped", 1)
+        else:
+            pipe.hincrby("autotune:reranker", "hurt", 1)
+    else:
+        pipe.hincrby("autotune:reranker", "neutral", 1)
+
+    # ── Margin calibration ───────────────────────────────────────
+    bucket = round(margin / MARGIN_BUCKET_SIZE) * MARGIN_BUCKET_SIZE
+    bucket_key = f"autotune:margin:{bucket:.3f}"
+    pipe.hincrby(bucket_key, "total", 1)
+    embedding_top = _signal_top_label(embedding_scores)
+    if embedding_top == llm_label:
+        pipe.hincrby(bucket_key, "agreed", 1)
+
+    pipe.execute()
+    print(f"📊 [autotune] margin={margin:.4f} bucket={bucket:.3f} "
+          f"emb_top={embedding_top} llm={llm_label} match={embedding_top == llm_label}")
+
+
+def get_learned_weights(
+    has_structural: bool,
+    has_reputation: bool,
+    has_affinity: bool,
+) -> dict[str, float]:
+    """
+    Compute blend weights from learned signal accuracies.
+    Returns normalised {signal: weight} ready for blending.
+    Falls back to hardcoded defaults during cold start (< MIN_AUTOTUNE_SAMPLES).
+    """
+    def _defaults():
+        raw = {"embedding": 1.0}
+        if has_structural:
+            raw["structural"] = STRUCTURAL_BOOST_WEIGHT
+        if has_reputation:
+            raw["reputation"] = SENDER_REPUTATION_WEIGHT
+        if has_affinity:
+            raw["affinity"] = SENDER_AFFINITY_WEIGHT
+        total = sum(raw.values())
+        return {k: v / total for k, v in raw.items()}
+
+    if not redis_client:
+        return _defaults()
+
+    # Single pipeline for all signal reads (1 round-trip)
+    sigs = ["embedding", "structural", "reputation", "affinity"]
+    pipe = redis_client.pipeline(transaction=False)
+    for sig in sigs:
+        pipe.hgetall(f"autotune:signal:{sig}")
+    results = pipe.execute()
+    signal_data = dict(zip(sigs, results))
+
+    total_samples = int(signal_data["embedding"].get("total", 0))
+    if total_samples < MIN_AUTOTUNE_SAMPLES:
+        return _defaults()
+
+    # ── Learned weights: accuracy² per signal (amplifies differences) ──
+    active = ["embedding"]
+    if has_structural:
+        active.append("structural")
+    if has_reputation:
+        active.append("reputation")
+    if has_affinity:
+        active.append("affinity")
+
+    default_map = {
+        "embedding":  1.0,
+        "structural": STRUCTURAL_BOOST_WEIGHT,
+        "reputation": SENDER_REPUTATION_WEIGHT,
+        "affinity":   SENDER_AFFINITY_WEIGHT,
+    }
+
+    raw_weights = {}
+    for sig in active:
+        data = signal_data[sig]
+        n = int(data.get("total", 0))
+        c = int(data.get("correct", 0))
+        if n >= 10:
+            accuracy = c / n
+            # accuracy² amplifies differences; floor 0.05 so nothing gets zeroed
+            raw_weights[sig] = max(accuracy ** 2, 0.05)
+        else:
+            # Not enough data for this signal yet — use default
+            raw_weights[sig] = default_map.get(sig, 0.1)
+
+    total = sum(raw_weights.values())
+    return {k: v / total for k, v in raw_weights.items()}
+
+
+def get_learned_reranker_weight() -> float:
+    """
+    Compute reranker blend weight from helped/hurt ratio.
+    High help rate → more weight to cross-encoder.
+    Falls back to RERANKER_BLEND_WEIGHT during cold start.
+    """
+    if not redis_client:
+        return RERANKER_BLEND_WEIGHT
+
+    data = redis_client.hgetall("autotune:reranker")
+    helped = int(data.get("helped", 0))
+    hurt = int(data.get("hurt", 0))
+    total = helped + hurt + int(data.get("neutral", 0))
+
+    if total < MIN_AUTOTUNE_SAMPLES:
+        return RERANKER_BLEND_WEIGHT
+
+    if helped + hurt == 0:
+        return RERANKER_BLEND_WEIGHT
+
+    help_ratio = helped / (helped + hurt)
+    return round(help_ratio * MAX_RERANKER_BLEND, 4)
+
+
+def get_learned_confidence_margin() -> float:
+    """
+    Auto-calibrate the confidence margin from historical margin→accuracy data.
+    Scans margin buckets from low to high. For each candidate threshold,
+    computes the embedding→LLM agreement rate among all samples with
+    margin >= that threshold. Returns the lowest threshold achieving
+    >= MARGIN_TARGET_ACCURACY agreement.
+    """
+    if not redis_client:
+        return CONFIDENCE_MARGIN
+
+    # Single pipeline for all bucket reads (1 round-trip)
+    pipe = redis_client.pipeline(transaction=False)
+    for i in range(16):
+        bv = i * MARGIN_BUCKET_SIZE
+        pipe.hgetall(f"autotune:margin:{bv:.3f}")
+    results = pipe.execute()
+
+    bucket_data = []
+    for i in range(16):
+        bv = i * MARGIN_BUCKET_SIZE
+        agreed = int(results[i].get("agreed", 0))
+        total = int(results[i].get("total", 0))
+        bucket_data.append((bv, agreed, total))
+
+    grand_total = sum(b[2] for b in bucket_data)
+    if grand_total < MIN_AUTOTUNE_SAMPLES:
+        return CONFIDENCE_MARGIN
+
+    # Right-cumulative: for threshold T, check agreement of all samples with margin >= T
+    bucket_data.sort(key=lambda x: x[0])  # ascending by margin
+    cum_agreed = sum(b[1] for b in bucket_data)
+    cum_total = sum(b[2] for b in bucket_data)
+
+    for bv, agreed, total in bucket_data:
+        if cum_total >= 10:
+            rate = cum_agreed / cum_total
+            if rate >= MARGIN_TARGET_ACCURACY:
+                return bv
+        cum_agreed -= agreed
+        cum_total -= total
+
+    return CONFIDENCE_MARGIN  # couldn't find safe threshold — keep default
 
 
 def generate_prototypes(label_name: str, description: Optional[str]) -> list[str]:
@@ -1085,19 +1320,10 @@ async def classify_email(request: ClassifyRequest):
                 reputation_scores[lbl] = 0.0
         has_reputation = any(v > 0 for v in reputation_scores.values())
 
-    # ── Step 6: Blend all signals ─────────────────────────────────
-    # Dynamic weight allocation: when a signal is inactive, its weight
-    # is redistributed proportionally to the active signals.
-    raw_weights = {"embedding": 1.0}    # always active
-    if has_structural:
-        raw_weights["structural"] = STRUCTURAL_BOOST_WEIGHT
-    if has_reputation:
-        raw_weights["reputation"] = SENDER_REPUTATION_WEIGHT
-    if has_affinity:
-        raw_weights["affinity"] = SENDER_AFFINITY_WEIGHT
-
-    total_weight = sum(raw_weights.values())
-    w = {k: v / total_weight for k, v in raw_weights.items()}
+    # ── Step 6: Blend all signals (auto-tuned weights) ────────────
+    # Weights are learned from LLM feedback accuracy.  During cold start
+    # (< MIN_AUTOTUNE_SAMPLES LLM calls), hardcoded defaults are used.
+    w = get_learned_weights(has_structural, has_reputation, has_affinity)
 
     label_scores: dict[str, float] = {}
     for lbl in label_names:
@@ -1111,9 +1337,12 @@ async def classify_email(request: ClassifyRequest):
         label_scores[lbl] = score
 
     # ── Step 7: Cross-encoder reranking ───────────────────────────
+    pre_rerank_top = max(label_scores, key=label_scores.get) if label_scores else ""
+    reranker_w = get_learned_reranker_weight()
     label_scores = rerank_top_labels(
-        email_text, label_prototypes, label_scores
+        email_text, label_prototypes, label_scores, blend_weight=reranker_w
     )
+    post_rerank_top = max(label_scores, key=label_scores.get) if label_scores else ""
 
     # ── Step 7.5: User-label priority boost (post-rerank) ────────
     # Applied AFTER reranking so the cross-encoder can't undo it.
@@ -1143,8 +1372,17 @@ async def classify_email(request: ClassifyRequest):
             if margin < USER_LABEL_CONFLICT_MARGIN:
                 user_label_conflict = True
 
-    use_llm = ((margin < CONFIDENCE_MARGIN) or (
-        top_score < LOW_ABSOLUTE_SCORE) or user_label_conflict) and request.use_llm
+    # ── Auto-tuned confidence margin + exploration ────────────────
+    learned_margin = get_learned_confidence_margin()
+    # Exploration: occasionally force LLM on high-confidence cases
+    # to collect calibration data for margin ranges above the threshold.
+    above_threshold = (margin >= learned_margin and
+                       top_score >= LOW_ABSOLUTE_SCORE and
+                       not user_label_conflict)
+    explore_llm = above_threshold and random.random() < AUTOTUNE_EXPLORE_RATE
+
+    use_llm = ((margin < learned_margin) or (
+        top_score < LOW_ABSOLUTE_SCORE) or user_label_conflict or explore_llm) and request.use_llm
 
     # Build method string showing which signals contributed
     method_parts = ["embedding"]
@@ -1157,6 +1395,8 @@ async def classify_email(request: ClassifyRequest):
     method_parts.append("reranker")
     if user_label_conflict:
         method_parts.append("user_conflict")
+    if explore_llm:
+        method_parts.append("explore")
 
     # ── Step 9: LLM fallback if needed ───────────────────────────
     if use_llm:
@@ -1193,6 +1433,21 @@ async def classify_email(request: ClassifyRequest):
             print(
                 f"⚠️  LLM confidence too low ({llm_confidence:.2f}) — skipping storage")
 
+        # ── Auto-tune: record which signals agreed with LLM ──────
+        record_autotune_signals(
+            llm_label=llm_label,
+            embedding_scores=embedding_scores,
+            structural_boost=structural_boost,
+            reputation_scores=reputation_scores,
+            affinity_scores=affinity_scores,
+            pre_rerank_top=pre_rerank_top,
+            post_rerank_top=post_rerank_top,
+            margin=margin,
+            has_structural=has_structural,
+            has_reputation=has_reputation,
+            has_affinity=has_affinity,
+        )
+
         update_sender_affinity(domain, llm_label, user_id,
                                is_user_label=(llm_label in user_scoped_labels))
         return ClassifyResponse(
@@ -1214,6 +1469,105 @@ async def classify_email(request: ClassifyRequest):
         all_scores={k: round(v, 4) for k, v in label_scores.items()},
 
     )
+
+
+# ─────────────────────────────────────────────
+# Debug / Admin — Auto-Tune Introspection
+# ─────────────────────────────────────────────
+
+@app.get("/debug/weights", summary="[Debug] View auto-tuned weights and signal stats")
+async def debug_weights():
+    """
+    Shows current learned vs default weights, per-signal accuracy rates,
+    reranker help/hurt stats, and margin calibration buckets.
+    """
+    if not redis_client:
+        return {"status": "redis_unavailable", "using": "hardcoded_defaults"}
+
+    # Signal accuracies
+    signal_stats = {}
+    sigs = ["embedding", "structural", "reputation", "affinity"]
+    pipe = redis_client.pipeline(transaction=False)
+    for sig in sigs:
+        pipe.hgetall(f"autotune:signal:{sig}")
+    results = pipe.execute()
+
+    for sig, data in zip(sigs, results):
+        n = int(data.get("total", 0))
+        c = int(data.get("correct", 0))
+        signal_stats[sig] = {
+            "total": n,
+            "correct": c,
+            "accuracy": round(c / n, 4) if n > 0 else None,
+        }
+
+    # Reranker delta
+    rd = redis_client.hgetall("autotune:reranker")
+    reranker_stats = {
+        "helped": int(rd.get("helped", 0)),
+        "hurt": int(rd.get("hurt", 0)),
+        "neutral": int(rd.get("neutral", 0)),
+    }
+
+    # Margin buckets
+    margin_buckets = {}
+    pipe = redis_client.pipeline(transaction=False)
+    for i in range(16):
+        bv = i * MARGIN_BUCKET_SIZE
+        pipe.hgetall(f"autotune:margin:{bv:.3f}")
+    bucket_results = pipe.execute()
+
+    for i in range(16):
+        bv = i * MARGIN_BUCKET_SIZE
+        data = bucket_results[i]
+        n = int(data.get("total", 0))
+        a = int(data.get("agreed", 0))
+        if n > 0:
+            margin_buckets[f"{bv:.3f}"] = {
+                "total": n,
+                "agreed": a,
+                "rate": round(a / n, 4),
+            }
+
+    total_obs = signal_stats["embedding"]["total"]
+    is_learned = total_obs >= MIN_AUTOTUNE_SAMPLES
+
+    return {
+        "status": "learned" if is_learned else f"cold_start ({total_obs}/{MIN_AUTOTUNE_SAMPLES})",
+        "signal_accuracies": signal_stats,
+        "reranker_delta": reranker_stats,
+        "margin_buckets": margin_buckets,
+        "active_weights": {
+            "blend": get_learned_weights(True, True, True),
+            "reranker_blend": get_learned_reranker_weight(),
+            "confidence_margin": get_learned_confidence_margin(),
+        },
+        "defaults": {
+            "structural": STRUCTURAL_BOOST_WEIGHT,
+            "reputation": SENDER_REPUTATION_WEIGHT,
+            "affinity": SENDER_AFFINITY_WEIGHT,
+            "reranker_blend": RERANKER_BLEND_WEIGHT,
+            "confidence_margin": CONFIDENCE_MARGIN,
+        },
+    }
+
+
+@app.delete("/debug/weights", summary="[Debug] Reset auto-tune data")
+async def reset_autotune():
+    """Clears all auto-tune Redis keys. Weights revert to hardcoded defaults."""
+    if not redis_client:
+        return {"status": "redis_unavailable"}
+
+    pipe = redis_client.pipeline(transaction=False)
+    for sig in ["embedding", "structural", "reputation", "affinity"]:
+        pipe.delete(f"autotune:signal:{sig}")
+    pipe.delete("autotune:reranker")
+    for i in range(16):
+        bv = i * MARGIN_BUCKET_SIZE
+        pipe.delete(f"autotune:margin:{bv:.3f}")
+    pipe.execute()
+
+    return {"status": "ok", "message": "Auto-tune data cleared. Using defaults until re-calibrated."}
 
 
 if __name__ == "__main__":
