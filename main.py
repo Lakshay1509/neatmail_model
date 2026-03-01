@@ -40,6 +40,7 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from pinecone import Pinecone
 from openai import OpenAI
+from openai import AzureOpenAI
 from structural_patterns import STRUCTURAL_PATTERNS, SIGNAL_TO_CATEGORY, CATEGORY_KEYWORDS
 
 # Only load .env locally, not on Modal
@@ -57,7 +58,8 @@ PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
 PINECONE_INDEX = os.environ["PINECONE_INDEX_NAME"]   # dim=1024, metric=cosine
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 UPSTASH_REDIS_URL = os.environ.get("UPSTASH_REDIS_URL", "")  # redis://...:port
-API_SECRET_KEY = os.environ["API_SECRET_KEY"]         # shared secret from backend
+# shared secret from backend
+API_SECRET_KEY = os.environ["API_SECRET_KEY"]
 
 GLOBAL_NAMESPACE = "labels"
 PROTOTYPES_PER_LABEL = 10
@@ -67,34 +69,43 @@ SCOPE_SYSTEM = "system"
 SCOPE_USER = "user"
 
 # Confidence thresholds
-CONFIDENCE_MARGIN        = 0.12   # send to LLM if margin below this (wider — let LLM arbitrate close calls)
-LOW_ABSOLUTE_SCORE       = 0.45   # top score must be strong to trust (lowered for blended score scale)
+# send to LLM if margin below this (wider — let LLM arbitrate close calls)
+CONFIDENCE_MARGIN = 0.12
+# top score must be strong to trust (lowered for blended score scale)
+LOW_ABSOLUTE_SCORE = 0.45
 
-TOP_K_PER_LABEL          = 15     # vectors fetched PER LABEL (per-label querying ensures equal retrieval budget)
-TOPK_MEAN_K              = 3      # average top-k matches per label (more robust than max)
-TOP_K                    = TOP_K_PER_LABEL  # kept for delete endpoints / admin queries
-SIMILARITY_THRESHOLD     = 0.85   # store more examples (less strict dedup)
+# vectors fetched PER LABEL (per-label querying ensures equal retrieval budget)
+TOP_K_PER_LABEL = 15
+TOPK_MEAN_K = 3      # average top-k matches per label (more robust than max)
+TOP_K = TOP_K_PER_LABEL  # kept for delete endpoints / admin queries
+SIMILARITY_THRESHOLD = 0.85   # store more examples (less strict dedup)
 LLM_CONFIDENCE_THRESHOLD = 0.80   # accept slightly less confident LLM results
-SENDER_AFFINITY_WEIGHT   = 0.08   # blend weight for per-user sender affinity (reduced; reputation takes rest)
+# blend weight for per-user sender affinity (reduced; reputation takes rest)
+SENDER_AFFINITY_WEIGHT = 0.08
 
 # Cross-encoder reranker
-RERANKER_MODEL_NAME      = "cross-encoder/nli-MiniLM2-L6-H768"
-RERANKER_TOP_N           = 5      # rerank top-N label candidates
-RERANKER_BLEND_WEIGHT    = 0.30   # cross-encoder vs embedding weight (reduced — preserve user-label signals)
+RERANKER_MODEL_NAME = "cross-encoder/nli-MiniLM2-L6-H768"
+RERANKER_TOP_N = 5      # rerank top-N label candidates
+# cross-encoder vs embedding weight (reduced — preserve user-label signals)
+RERANKER_BLEND_WEIGHT = 0.30
 
 # Structural feature prior boost (zero-ML)
-STRUCTURAL_BOOST_WEIGHT  = 0.25   # blend weight for structural signal prior (raised — strong zero-ML signal)
+# blend weight for structural signal prior (raised — strong zero-ML signal)
+STRUCTURAL_BOOST_WEIGHT = 0.25
 
 # User label priority — user-defined labels get a score multiplier so they aren't
 # drowned out by system labels with many more prototypes.
 # e.g. user's "Payments" label beats system "Automated alerts" when appropriate.
-USER_LABEL_PRIORITY_BOOST = 1.50  # multiply final score for user-scoped labels (applied post-rerank)
+# multiply final score for user-scoped labels (applied post-rerank)
+USER_LABEL_PRIORITY_BOOST = 1.50
 
 # Structural signal amplification for user-custom labels
-USER_STRUCTURAL_AMPLIFIER = 1.5   # multiply structural boost when it matches a user-custom label
+# multiply structural boost when it matches a user-custom label
+USER_STRUCTURAL_AMPLIFIER = 1.5
 
 # User-label conflict — force LLM when user-custom label competes with system label
-USER_LABEL_CONFLICT_MARGIN = 0.15 # force LLM if user-label is within this margin of top
+# force LLM if user-label is within this margin of top
+USER_LABEL_CONFLICT_MARGIN = 0.15
 
 # Sender reputation (global Bayesian-smoothed, collaborative filtering)
 REPUTATION_PRIOR_STRENGTH = 10.0  # Bayesian pseudo-count for smoothing
@@ -123,40 +134,29 @@ async def verify_api_key(authorization: str = Header(...)):
         )
 
 
-
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global embedding_model, pinecone_index, openai_client, redis_client, reranker_model
 
-    if hasattr(app.state, "embedding_model"):
-        # ── Running on Modal ──────────────────────────────────────────
-        # Models already loaded by @enter() before this runs.
-        # Just read from app.state — no blocking work here.
-        embedding_model = app.state.embedding_model
-        pinecone_index = app.state.pinecone_index
-        openai_client = app.state.openai_client
-        reranker_model = app.state.reranker_model
-        print("✅ Clients ready (restored from Modal snapshot).")
-    else:
-        # ── Local development fallback ────────────────────────────────
-        print("Loading Qwen3 embedding model...")
-        embedding_model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
+    # ── Local development fallback ────────────────────────────────
+    print("Loading Qwen3 embedding model...")
+    embedding_model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
 
-        print("Loading cross-encoder reranker...")
-        reranker_model = CrossEncoder(RERANKER_MODEL_NAME)
+    print("Loading cross-encoder reranker...")
+    reranker_model = CrossEncoder(RERANKER_MODEL_NAME)
 
+    print("Connecting to Pinecone...")
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    pinecone_index = pc.Index(PINECONE_INDEX)
 
+    print("Connecting to OpenAI...")
+    openai_client = AzureOpenAI(
+        api_key=os.getenv("AZURE_API_KEY"),
+        azure_endpoint=os.getenv("AZURE_ENDPOINT"),
+        api_version="2024-04-01-preview",
+    )
 
-        print("Connecting to Pinecone...")
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        pinecone_index = pc.Index(PINECONE_INDEX)
-
-        print("Connecting to OpenAI...")
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
-        print("✅ All clients ready.")
+    print("✅ All clients ready.")
 
     # ── Redis (Upstash) for sender affinity ───────────────────────
     if UPSTASH_REDIS_URL:
@@ -207,10 +207,12 @@ class ClassifyRequest(BaseModel):
     labels: list[str]
     use_llm: Optional[bool] = True
 
+
 class Email(BaseModel):
     subject: str
     sender: str
     body: str
+
 
 class ClassifyResponse(BaseModel):
     label: str
@@ -218,9 +220,6 @@ class ClassifyResponse(BaseModel):
     margin: float
     method: str
     all_scores: dict[str, float]
-
-
-   
 
 
 def embed_document(text: str) -> list[float]:
@@ -407,7 +406,8 @@ def update_sender_affinity(domain: str, label: str, user_id: str, is_user_label:
         # Only record in global reputation when the label is a system label.
         # User-custom label wins must not teach other users' classifiers.
         pipe.hincrby(f"affinity:sys:{domain}", label, 1)
-        pipe.sadd(f"rep:users:{domain}:{label}", user_id)   # unique user tracking
+        pipe.sadd(f"rep:users:{domain}:{label}",
+                  user_id)   # unique user tracking
     pipe.hincrby(f"affinity:u:{user_id}:{domain}", label, 1)
     pipe.execute()
 
@@ -635,8 +635,8 @@ Email:
         lines = raw_text.split("\n", 2)
         parsed = {
             "subject": lines[0].removeprefix("Subject: ").strip(),
-            "sender":  lines[1].removeprefix("Sender: ").strip()  if len(lines) > 1 else "",
-            "body":    lines[2].removeprefix("Body: ").strip()    if len(lines) > 2 else "",
+            "sender":  lines[1].removeprefix("Sender: ").strip() if len(lines) > 1 else "",
+            "body":    lines[2].removeprefix("Body: ").strip() if len(lines) > 2 else "",
         }
 
     if return_structured:
@@ -937,7 +937,8 @@ async def classify_email(request: ClassifyRequest):
 
     # ── Step 1: Validate each label exists in at least one tier ──
     missing = []
-    user_scoped_labels: set[str] = set()   # labels that are user-defined for this user
+    # labels that are user-defined for this user
+    user_scoped_labels: set[str] = set()
 
     def check_label(label: str) -> tuple[str, bool, str]:
         """
@@ -965,7 +966,8 @@ async def classify_email(request: ClassifyRequest):
         ).matches
         return label, bool(in_user), SCOPE_USER if in_user else ""
 
-    check_tasks = [asyncio.to_thread(check_label, label) for label in label_names]
+    check_tasks = [asyncio.to_thread(check_label, label)
+                   for label in label_names]
     check_results = await asyncio.gather(*check_tasks)
 
     for label, exists, scope in check_results:
@@ -1018,7 +1020,7 @@ async def classify_email(request: ClassifyRequest):
 
     # Build per-label tasks for both system and user tiers — all run concurrently
     system_filter = {"scope": {"$ne": SCOPE_USER}}
-    user_filter   = {"scope": {"$eq": SCOPE_USER}, "user_id": {"$eq": user_id}}
+    user_filter = {"scope": {"$eq": SCOPE_USER}, "user_id": {"$eq": user_id}}
 
     per_label_tasks = [
         asyncio.to_thread(query_label, lbl, scope_filter)
@@ -1029,7 +1031,7 @@ async def classify_email(request: ClassifyRequest):
 
     # Interleave results: [lbl0_sys, lbl0_user, lbl1_sys, lbl1_user, ...]
     for i, lbl in enumerate(label_names):
-        for matches in per_label_results[i * 2 : i * 2 + 2]:   # sys + user pair
+        for matches in per_label_results[i * 2: i * 2 + 2]:   # sys + user pair
             for match in matches:
                 label_hits[lbl].append(match.score)
                 proto = match.metadata.get("prototype", "")
@@ -1051,13 +1053,15 @@ async def classify_email(request: ClassifyRequest):
     structural_signals = extract_structural_signals(
         request.subject, request.sender, request.body
     )
-    structural_boost = compute_structural_boost(structural_signals, label_names)
+    structural_boost = compute_structural_boost(
+        structural_signals, label_names)
 
     # Amplify structural boost for user-custom labels — the user explicitly
     # created this label AND the email has structural evidence for it.
     for lbl in user_scoped_labels:
         if lbl in structural_boost and structural_boost[lbl] > 0:
-            structural_boost[lbl] = min(structural_boost[lbl] * USER_STRUCTURAL_AMPLIFIER, 1.0)
+            structural_boost[lbl] = min(
+                structural_boost[lbl] * USER_STRUCTURAL_AMPLIFIER, 1.0)
 
     has_structural = any(v > 0 for v in structural_boost.values())
 
@@ -1135,7 +1139,7 @@ async def classify_email(request: ClassifyRequest):
         second_lbl = sorted_labels[1][0]
         # If system label won but user-label is close behind (or vice versa)
         if ((top_lbl not in user_scoped_labels and second_lbl in user_scoped_labels) or
-            (top_lbl in user_scoped_labels and second_lbl not in user_scoped_labels)):
+                (top_lbl in user_scoped_labels and second_lbl not in user_scoped_labels)):
             if margin < USER_LABEL_CONFLICT_MARGIN:
                 user_label_conflict = True
 
@@ -1189,24 +1193,26 @@ async def classify_email(request: ClassifyRequest):
             print(
                 f"⚠️  LLM confidence too low ({llm_confidence:.2f}) — skipping storage")
 
-        update_sender_affinity(domain, llm_label, user_id, is_user_label=(llm_label in user_scoped_labels))
+        update_sender_affinity(domain, llm_label, user_id,
+                               is_user_label=(llm_label in user_scoped_labels))
         return ClassifyResponse(
             label=llm_label,
             confidence=round(top_score, 4),
             margin=round(margin, 4),
             method="llm_fallback+" + "+".join(method_parts),
             all_scores={k: round(v, 4) for k, v in label_scores.items()},
-            
+
         )
 
-    update_sender_affinity(domain, top_label, user_id, is_user_label=(top_label in user_scoped_labels))
+    update_sender_affinity(domain, top_label, user_id,
+                           is_user_label=(top_label in user_scoped_labels))
     return ClassifyResponse(
         label=top_label,
         confidence=round(top_score, 4),
         margin=round(margin, 4),
         method="+".join(method_parts),
         all_scores={k: round(v, 4) for k, v in label_scores.items()},
-        
+
     )
 
 
