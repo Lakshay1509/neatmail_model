@@ -529,6 +529,7 @@ def record_autotune_signals(
     affinity_scores: dict[str, float],
     pre_rerank_top: str,
     post_rerank_top: str,
+    final_top: str,
     margin: float,
     has_structural: bool,
     has_reputation: bool,
@@ -559,6 +560,11 @@ def record_autotune_signals(
         if sig_top == llm_label:
             pipe.hincrby(key, "correct", 1)
 
+    # ── Full pipeline accuracy (all signals + reranker + boosts) ────────
+    pipe.hincrby("autotune:signal:final_blended", "total", 1)
+    if final_top == llm_label:
+        pipe.hincrby("autotune:signal:final_blended", "correct", 1)
+
     # ── Reranker delta (helped / hurt / neutral) ─────────────────
     if pre_rerank_top != post_rerank_top:
         if post_rerank_top == llm_label:
@@ -578,7 +584,8 @@ def record_autotune_signals(
 
     pipe.execute()
     print(f"📊 [autotune] margin={margin:.4f} bucket={bucket:.3f} "
-          f"emb_top={embedding_top} llm={llm_label} match={embedding_top == llm_label}")
+          f"emb_top={embedding_top} final_top={final_top} llm={llm_label} "
+          f"match={embedding_top == llm_label} final_match={final_top == llm_label}")
 
 
 def get_learned_weights(
@@ -1447,6 +1454,7 @@ async def classify_email(request: ClassifyRequest):
             affinity_scores=affinity_scores,
             pre_rerank_top=pre_rerank_top,
             post_rerank_top=post_rerank_top,
+            final_top=top_label,
             margin=margin,
             has_structural=has_structural,
             has_reputation=has_reputation,
@@ -1511,7 +1519,7 @@ async def debug_weights():
 
     # Signal accuracies
     signal_stats = {}
-    sigs = ["embedding", "structural", "reputation", "affinity"]
+    sigs = ["embedding", "structural", "reputation", "affinity", "final_blended"]
     pipe = redis_client.pipeline(transaction=False)
     for sig in sigs:
         pipe.hgetall(f"autotune:signal:{sig}")
@@ -1584,7 +1592,7 @@ async def reset_autotune():
         return {"status": "redis_unavailable"}
 
     pipe = redis_client.pipeline(transaction=False)
-    for sig in ["embedding", "structural", "reputation", "affinity"]:
+    for sig in ["embedding", "structural", "reputation", "affinity", "final_blended"]:
         pipe.delete(f"autotune:signal:{sig}")
     pipe.delete("autotune:reranker")
     for i in range(16):
