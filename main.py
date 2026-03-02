@@ -74,6 +74,11 @@ SCOPE_USER = "user"
 CONFIDENCE_MARGIN = 0.12
 # top score must be strong to trust (lowered for blended score scale)
 LOW_ABSOLUTE_SCORE = 0.45
+# absolute floor — if the best blended score is still below this after all
+# signals (and optionally LLM), return label="" rather than a wrong label.
+# 0.30 sits well below the LLM-routing threshold (0.45) so it only fires
+# when every signal is genuinely weak (e.g. email fits none of the labels).
+MIN_CLASSIFICATION_SCORE = 0.30
 
 # vectors fetched PER LABEL (per-label querying ensures equal retrieval budget)
 TOP_K_PER_LABEL = 15
@@ -1448,6 +1453,16 @@ async def classify_email(request: ClassifyRequest):
             has_affinity=has_affinity,
         )
 
+        # LLM returned no confident match — propagate empty label.
+        if not llm_label:
+            return ClassifyResponse(
+                label="",
+                confidence=round(top_score, 4),
+                margin=round(margin, 4),
+                method="llm_fallback+" + "+".join(method_parts) + "+rejected",
+                all_scores={k: round(v, 4) for k, v in label_scores.items()},
+            )
+
         update_sender_affinity(domain, llm_label, user_id,
                                is_user_label=(llm_label in user_scoped_labels))
         return ClassifyResponse(
@@ -1457,6 +1472,16 @@ async def classify_email(request: ClassifyRequest):
             method="llm_fallback+" + "+".join(method_parts),
             all_scores={k: round(v, 4) for k, v in label_scores.items()},
 
+        )
+
+    # Rejection floor — no label fits well enough; return empty rather than wrong.
+    if top_score < MIN_CLASSIFICATION_SCORE:
+        return ClassifyResponse(
+            label="",
+            confidence=round(top_score, 4),
+            margin=round(margin, 4),
+            method="+".join(method_parts) + "+rejected",
+            all_scores={k: round(v, 4) for k, v in label_scores.items()},
         )
 
     update_sender_affinity(domain, top_label, user_id,
