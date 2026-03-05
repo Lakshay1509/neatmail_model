@@ -407,11 +407,24 @@ def extract_domain(sender: str) -> str:
     return match.group(1).lower() if match else ""
 
 
-def update_sender_affinity(domain: str, label: str, user_id: str, is_user_label: bool = False):
+def extract_email_address(sender: str) -> str:
+    """Extract full email address from sender. 'John <noreply@abc.com>' → 'noreply@abc.com'"""
+    match = re.search(r'[\w.+-]+@[\w.-]+', sender)
+    return match.group(0).lower() if match else ""
+
+
+def update_sender_affinity(
+    domain: str, label: str, user_id: str,
+    sender_address: str = "", is_user_label: bool = False,
+):
     """
     Record a classification result in Redis.
-    Updates global counts, per-user counts, AND the unique-user set
-    for this domain-label pair (powers the sender reputation graph).
+    Updates global counts, per-user domain counts, per-user address counts,
+    AND the unique-user set for this domain-label pair (powers sender reputation).
+
+    Address-level affinity (affinity:u:{user_id}:addr:{address}) provides
+    fine-grained history so that marketing@abc.com and automated@abc.com
+    build separate affinity profiles.
 
     is_user_label=True: the winning label is a user-custom label.
     In that case we skip the global affinity:sys update so that this
@@ -428,20 +441,44 @@ def update_sender_affinity(domain: str, label: str, user_id: str, is_user_label:
         pipe.sadd(f"rep:users:{domain}:{label}",
                   user_id)   # unique user tracking
     pipe.hincrby(f"affinity:u:{user_id}:{domain}", label, 1)
+    # Also store per-address affinity for fine-grained sender discrimination
+    if sender_address:
+        pipe.hincrby(f"affinity:u:{user_id}:addr:{sender_address}", label, 1)
     pipe.execute()
 
 
 def get_sender_affinity_scores(
-    domain: str, user_id: str, label_names: list[str]
+    domain: str, user_id: str, label_names: list[str],
+    sender_address: str = "",
 ) -> dict[str, float]:
     """
-    Per-user sender affinity — this user's personal history with a domain.
+    Per-user sender affinity — this user's personal history with a sender.
+
+    Two-tier lookup:
+      1. Address-level (e.g. marketing@abc.com) — most specific, used when available.
+      2. Domain-level  (e.g. abc.com) — fallback when no address-level data exists.
+
+    This prevents marketing@abc.com's history from biasing OTPs sent by
+    automated@abc.com (different local-part → separate Redis key).
+
     Returns normalized scores {label: 0.0–1.0} summing to 1.0,
     or all 0s if no affinity data exists.
     """
     if not domain or not redis_client:
         return {label: 0.0 for label in label_names}
 
+    # ── Tier 1: Address-level affinity (most specific) ────────────
+    if sender_address:
+        addr_counts = redis_client.hgetall(
+            f"affinity:u:{user_id}:addr:{sender_address}"
+        )
+        if addr_counts:
+            filtered = {lbl: int(addr_counts.get(lbl, 0)) for lbl in label_names}
+            total = sum(filtered.values())
+            if total > 0:
+                return {lbl: count / total for lbl, count in filtered.items()}
+
+    # ── Tier 2: Domain-level fallback ─────────────────────────────
     user_counts = redis_client.hgetall(f"affinity:u:{user_id}:{domain}")
     if not user_counts:
         return {label: 0.0 for label in label_names}
@@ -1314,10 +1351,13 @@ async def classify_email(request: ClassifyRequest):
 
     # ── Step 5: Sender reputation + per-user affinity ─────────────
     domain = extract_domain(request.sender)
+    sender_address = extract_email_address(request.sender)
     reputation_scores = get_sender_reputation_scores(domain, label_names)
     has_reputation = any(v > 0 for v in reputation_scores.values())
 
-    affinity_scores = get_sender_affinity_scores(domain, user_id, label_names)
+    affinity_scores = get_sender_affinity_scores(
+        domain, user_id, label_names, sender_address=sender_address
+    )
     has_affinity = any(v > 0 for v in affinity_scores.values())
 
     # ── Guard: protect custom labels from cross-user reputation pollution ─────
@@ -1472,6 +1512,7 @@ async def classify_email(request: ClassifyRequest):
             )
 
         update_sender_affinity(domain, llm_label, user_id,
+                               sender_address=sender_address,
                                is_user_label=(llm_label in user_scoped_labels))
         return ClassifyResponse(
             label=llm_label,
@@ -1493,6 +1534,7 @@ async def classify_email(request: ClassifyRequest):
         )
 
     update_sender_affinity(domain, top_label, user_id,
+                           sender_address=sender_address,
                            is_user_label=(top_label in user_scoped_labels))
     return ClassifyResponse(
         label=top_label,
