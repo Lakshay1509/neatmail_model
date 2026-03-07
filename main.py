@@ -819,16 +819,21 @@ ALLOWED CATEGORIES (case-sensitive, exact match required):
 - {labels_str}
 
 RULES (highest priority first):
-1. SPECIFICITY: Always prefer the MOST SPECIFIC matching category.
+1. EMAIL CONTENT > SENDER IDENTITY: Classify by what the email SAYS, not who sent it.
+   - A login alert from a payments app (e.g. Splitwise, PayPal) is a SECURITY/ALERT email, NOT a payment.
+   - A welcome email from any service is an ONBOARDING/UPDATE email, NOT an action item.
+   - A shipping update from a retailer is an ORDER/SHIPPING email, NOT marketing.
+2. SPECIFICITY: Always prefer the MOST SPECIFIC matching category.
    - If "Payments" exists, use it for payment/transaction emails instead of generic "Automated alerts"
    - If "Orders" exists, use it for shipping/delivery emails instead of "Updates"
    - Specific user-defined labels ALWAYS beat generic catch-all labels
-2. PURPOSE: Classify by the email's PRIMARY PURPOSE, not surface keywords:
+3. PURPOSE: Classify by the email's PRIMARY PURPOSE, not surface keywords:
    - Payment/transaction/invoice/billing/UPI/debit/credit → payment-related category
+   - Login alerts/new device/sign-in notifications → security/alert category
+   - Welcome/onboarding/account created → updates/onboarding category
    - Calendar/meeting/RSVP/invite → event-related category
    - Marketing/promotions/deals/offers → marketing-related category
    - System notifications with no specific purpose → alerts/notification category
-3. DOMAIN: Match sender domain patterns to category purpose
 4. CONFIDENCE: If < 85% confident → return empty string for label
 
 OUTPUT FORMAT (strict JSON):

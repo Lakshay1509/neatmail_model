@@ -50,6 +50,19 @@ STRUCTURAL_PATTERNS: dict[str, re.Pattern] = {
         r'(?i)(weekly\s?digest|daily\s?roundup|newsletter'
         r'|read\s?more\s?articles?|top\s?stories|in\s?this\s?issue)'
     ),
+    "login_alert": re.compile(
+        r'(?i)(new\s?(?:sign[\s-]?in|log[\s-]?in|device|login)'
+        r'|logged\s?in\s?from|sign[\s-]?in\s?(?:from|on|detected)'
+        r'|unrecogni[sz]ed\s?(?:device|login|sign[\s-]?in)'
+        r'|suspicious\s?(?:sign[\s-]?in|login|activity)'
+        r'|access(?:ed)?\s?from\s?(?:a\s?)?new)'
+    ),
+    "welcome": re.compile(
+        r'(?i)(welcome\s?to|getting\s?started|thanks?\s?for\s?(?:signing|joining|registering)'
+        r'|account\s?(?:has\s?been\s?)?created|you.?re\s?all\s?set'
+        r'|activate\s?your\s?account|confirm\s?your\s?(?:email|account)'
+        r'|successfully\s?(?:registered|signed\s?up|created))'
+    ),
 }
 
 # ─────────────────────────────────────────────
@@ -66,6 +79,8 @@ SIGNAL_TO_CATEGORY: dict[str, dict[str, float]] = {
     "action_required": {"urgent": 0.60, "important": 0.50, "action": 0.55},
     "social":          {"social": 0.70, "notifications": 0.40},
     "newsletter":      {"newsletter": 0.60, "marketing": 0.30},
+    "login_alert":     {"security": 0.80, "alerts": 0.60, "automated": 0.40},
+    "welcome":         {"onboarding": 0.75, "updates": 0.40, "automated": 0.30},
 }
 
 # ─────────────────────────────────────────────
@@ -92,4 +107,5 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "meetings":      ["meeting", "standup", "sync", "call", "huddle"],
     "automated":     ["automat", "bot", "noreply", "system", "generated"],
     "action":        ["action", "todo", "task", "assign", "require"],
+    "onboarding":    ["welcome", "onboard", "getting started", "setup", "intro", "activate"],
 }
