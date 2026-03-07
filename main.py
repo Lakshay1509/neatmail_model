@@ -42,7 +42,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from pinecone import Pinecone
 from openai import OpenAI
 from openai import AzureOpenAI
-from structural_patterns import STRUCTURAL_PATTERNS, SIGNAL_TO_CATEGORY, CATEGORY_KEYWORDS
+# from structural_patterns import STRUCTURAL_PATTERNS, SIGNAL_TO_CATEGORY, CATEGORY_KEYWORDS
 
 # Only load .env locally, not on Modal
 import os
@@ -1338,21 +1338,21 @@ async def classify_email(request: ClassifyRequest):
 
     # (User-label priority boost applied post-rerank — see Step 7.5)
 
-    # ── Step 4: Structural feature extraction ─────────────────────
-    structural_signals = extract_structural_signals(
-        request.subject, request.sender, request.body
-    )
-    structural_boost = compute_structural_boost(
-        structural_signals, label_names)
-
-    # Amplify structural boost for user-custom labels — the user explicitly
-    # created this label AND the email has structural evidence for it.
-    for lbl in user_scoped_labels:
-        if lbl in structural_boost and structural_boost[lbl] > 0:
-            structural_boost[lbl] = min(
-                structural_boost[lbl] * USER_STRUCTURAL_AMPLIFIER, 1.0)
-
-    has_structural = any(v > 0 for v in structural_boost.values())
+    # ── Step 4: Structural feature extraction (DISABLED) ───────────
+    # structural_signals = extract_structural_signals(
+    #     request.subject, request.sender, request.body
+    # )
+    # structural_boost = compute_structural_boost(
+    #     structural_signals, label_names)
+    #
+    # # Amplify structural boost for user-custom labels — the user explicitly
+    # # created this label AND the email has structural evidence for it.
+    # for lbl in user_scoped_labels:
+    #     if lbl in structural_boost and structural_boost[lbl] > 0:
+    #         structural_boost[lbl] = min(
+    #             structural_boost[lbl] * USER_STRUCTURAL_AMPLIFIER, 1.0)
+    structural_boost: dict[str, float] = {lbl: 0.0 for lbl in label_names}
+    has_structural = False
 
     # ── Step 5: Sender reputation + per-user affinity ─────────────
     domain = extract_domain(request.sender)
@@ -1501,7 +1501,7 @@ async def classify_email(request: ClassifyRequest):
             post_rerank_top=post_rerank_top,
             final_top=top_label,
             margin=margin,
-            has_structural=has_structural,
+            has_structural=False,  # structural disabled
             has_reputation=has_reputation,
             has_affinity=has_affinity,
         )
