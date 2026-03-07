@@ -1566,7 +1566,7 @@ async def debug_weights():
 
     # Signal accuracies
     signal_stats = {}
-    sigs = ["embedding", "structural", "reputation", "affinity", "final_blended"]
+    sigs = ["embedding", "reputation", "affinity", "final_blended"]
     pipe = redis_client.pipeline(transaction=False)
     for sig in sigs:
         pipe.hgetall(f"autotune:signal:{sig}")
@@ -1618,12 +1618,11 @@ async def debug_weights():
         "reranker_delta": reranker_stats,
         "margin_buckets": margin_buckets,
         "active_weights": {
-            "blend": get_learned_weights(True, True, True),
+            "blend": get_learned_weights(False, True, True),
             "reranker_blend": get_learned_reranker_weight(),
             "confidence_margin": get_learned_confidence_margin(),
         },
         "defaults": {
-            "structural": STRUCTURAL_BOOST_WEIGHT,
             "reputation": SENDER_REPUTATION_WEIGHT,
             "affinity": SENDER_AFFINITY_WEIGHT,
             "reranker_blend": RERANKER_BLEND_WEIGHT,
@@ -1639,7 +1638,7 @@ async def reset_autotune():
         return {"status": "redis_unavailable"}
 
     pipe = redis_client.pipeline(transaction=False)
-    for sig in ["embedding", "structural", "reputation", "affinity", "final_blended"]:
+    for sig in ["embedding", "reputation", "affinity", "final_blended"]:
         pipe.delete(f"autotune:signal:{sig}")
     pipe.delete("autotune:reranker")
     for i in range(16):
