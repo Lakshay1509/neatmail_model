@@ -878,7 +878,7 @@ Available categories:
     return predicted, llm_confidence
 
 
-def clean_email_for_storage(subject: str, sender: str, body: str, return_structured: bool = False) -> str | dict:
+def clean_email_for_storage(subject: str, sender: str, body: str, return_structured: bool = False) -> str | dict | None:
     raw_text = f"Subject: {subject}\nSender: {sender}\nBody: {body[:500]}"
 
     anonymize_prompt = f"""You are an email anonymizer preparing training data for an email classifier.
@@ -919,14 +919,8 @@ Email:
             "body":    data.get("body",    ""),
         }
     except Exception as e:
-        print(f"⚠️  LLM anonymization failed, storing raw truncated text: {e}")
-        # Fallback: best-effort split so the shape is always consistent
-        lines = raw_text.split("\n", 2)
-        parsed = {
-            "subject": lines[0].removeprefix("Subject: ").strip(),
-            "sender":  lines[1].removeprefix("Sender: ").strip() if len(lines) > 1 else "",
-            "body":    lines[2].removeprefix("Body: ").strip() if len(lines) > 2 else "",
-        }
+        print(f"⚠️  LLM anonymization failed — skipping storage: {e}")
+        return None
 
     if return_structured:
         return parsed
@@ -988,6 +982,10 @@ def store_learned_example(
         return
 
     cleaned_text = clean_email_for_storage(subject, sender, body)
+    if not cleaned_text:
+        print(
+            f"⏭️  Skipping storage — anonymization failed for '{label}' ({scope_tag})")
+        return
 
     email_hash = hashlib.md5(
         f"{subject}{sender}{body[:200]}".encode()
