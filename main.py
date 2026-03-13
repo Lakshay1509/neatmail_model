@@ -57,7 +57,8 @@ if not os.environ.get("MODAL_ENVIRONMENT"):
 
 PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
 PINECONE_INDEX = os.environ["PINECONE_INDEX_NAME"]   # dim=1024, metric=cosine
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_API_KEY = os.environ["AZURE_API_KEY"]
+OPENAI_ENDPOINT = os.environ["AZURE_ENDPOINT"]
 UPSTASH_REDIS_URL = os.environ.get("UPSTASH_REDIS_URL", "")  # redis://...:port
 # shared secret from backend
 API_SECRET_KEY = os.environ["API_SECRET_KEY"]
@@ -168,10 +169,9 @@ async def lifespan(app: FastAPI):
     pinecone_index = pc.Index(PINECONE_INDEX)
 
     print("Connecting to OpenAI...")
-    openai_client = AzureOpenAI(
-        api_key=os.getenv("AZURE_API_KEY"),
-        azure_endpoint=os.getenv("AZURE_ENDPOINT"),
-        api_version="2024-04-01-preview",
+    openai_client = OpenAI(
+        base_url=OPENAI_ENDPOINT,
+        api_key=OPENAI_API_KEY
     )
 
     print("✅ All clients ready.")
