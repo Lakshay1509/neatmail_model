@@ -856,7 +856,6 @@ Available categories:
             {"role": "user", "content": user_prompt},
         ],
         response_format={"type": "json_object"},
-        max_completion_tokens=50,
         seed=42,
     )
 
@@ -906,8 +905,6 @@ Email:
         response = openai_client.chat.completions.create(
             model="gpt-5-nano",
             messages=[{"role": "user", "content": anonymize_prompt}],
-            temperature=0.2,
-            max_completion_tokens=400,
             response_format={"type": "json_object"},  # ← guarantees valid JSON
         )
         data = json.loads(response.choices[0].message.content)
