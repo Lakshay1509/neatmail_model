@@ -789,7 +789,6 @@ Format: {{"prototypes": ["prototype 1 text", "prototype 2 text", ...]}}
         model="gpt-5-nano",
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
-        temperature=0.7
     )
 
     parsed = json.loads(response.choices[0].message.content)
@@ -857,8 +856,7 @@ Available categories:
             {"role": "user", "content": user_prompt},
         ],
         response_format={"type": "json_object"},
-        temperature=0,
-        max_tokens=50,
+        max_completion_tokens=50,
         seed=42,
     )
 
@@ -909,7 +907,7 @@ Email:
             model="gpt-5-nano",
             messages=[{"role": "user", "content": anonymize_prompt}],
             temperature=0.2,
-            max_tokens=400,
+            max_completion_tokens=400,
             response_format={"type": "json_object"},  # ← guarantees valid JSON
         )
         data = json.loads(response.choices[0].message.content)
