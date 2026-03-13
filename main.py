@@ -786,7 +786,7 @@ Format: {{"prototypes": ["prototype 1 text", "prototype 2 text", ...]}}
 """
 
     response = openai_client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-5-nano",
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
         temperature=0.7
@@ -851,7 +851,7 @@ Available categories:
 - {labels_str}"""
 
     response = openai_client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-5-nano",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -885,7 +885,7 @@ def clean_email_for_storage(subject: str, sender: str, body: str, return_structu
 
 Your task:
 - Identify and replace ALL personal information (full names, email addresses, URLs/links,
-  phone numbers, account numbers, company names, physical addresses) with natural,
+  phone numbers, account numbers, company names, physical addresses etc.) with natural,
   role-based descriptions that preserve context.
   Good replacement examples:
     Person name  → "a colleague", "a client", "the support agent", "a vendor"
@@ -906,7 +906,7 @@ Email:
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-5-nano",
             messages=[{"role": "user", "content": anonymize_prompt}],
             temperature=0.2,
             max_tokens=400,
@@ -999,7 +999,7 @@ def store_learned_example(
         "source":        "llm_fallback",
         "email_hash":    email_hash,
         "sender_domain": sender_domain,
-        "llm_model":     "gpt-4.1-mini",
+        "llm_model":     "gpt-5-nano",
         "created_at":    datetime.now(timezone.utc).isoformat()
     }
     if scope == SCOPE_USER:
