@@ -217,6 +217,11 @@ class DeleteUserLabelRequest(BaseModel):
     label_name: str
 
 
+class DeleteVectorsByFilterRequest(BaseModel):
+    label: str
+    llm_model: str
+
+
 class ClassifyRequest(BaseModel):
     user_id: str
     subject: str
@@ -833,6 +838,7 @@ RULES (highest priority first):
    - Calendar/meeting/RSVP/invite → event-related category
    - Marketing/promotions/deals/offers → marketing-related category
    - System notifications with no specific purpose → alerts/notification category
+   - Automated confirmations/receipts (e.g., "We received your request", "Order confirmed") → updates/orders category, NEVER "pending response" or action items.
 4. CONFIDENCE: If < 85% confident → return empty string for label
 
 OUTPUT FORMAT (strict JSON):
@@ -1187,6 +1193,44 @@ async def delete_user_label(request: DeleteUserLabelRequest):
     )
 
     return {"status": "ok", "label": label_name, "user_id": user_id, "deleted": len(results.matches)}
+
+
+@app.delete("/admin/vectors", summary="[Admin] Delete vectors by metadata filter")
+async def delete_vectors_by_filter(request: DeleteVectorsByFilterRequest):
+    """
+    Deletes vectors from Pinecone using metadata filters.
+
+    Example payload:
+    {
+      "label": "pending response",
+      "llm_model": "gpt-4.1-mini"
+    }
+    """
+    label = request.label.strip()
+    llm_model = request.llm_model.strip()
+
+    if not label:
+        raise HTTPException(status_code=400, detail="label cannot be empty.")
+    if not llm_model:
+        raise HTTPException(status_code=400, detail="llm_model cannot be empty.")
+
+    pinecone_index.delete(
+        namespace=GLOBAL_NAMESPACE,
+        filter={
+            "label": {"$eq": label},
+            "llm_model": {"$eq": llm_model},
+        },
+    )
+
+    return {
+        "status": "ok",
+        "namespace": GLOBAL_NAMESPACE,
+        "filter": {
+            "label": label,
+            "llm_model": llm_model,
+        },
+        "message": "Delete request submitted to Pinecone.",
+    }
 
 
 # ─────────────────────────────────────────────

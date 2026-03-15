@@ -46,6 +46,11 @@ STRUCTURAL_PATTERNS: dict[str, re.Pattern] = {
         r'(?i)(liked?\s+your|commented?\s+on|mentioned?\s+you'
         r'|tagged?\s+you|new\s?follower|friend\s?request|connection\s?request)'
     ),
+    "confirmation": re.compile(
+        r'(?i)(order\s?confirmation|reservation\s?request|we(?:\'|\si| ha)ve\s?received\s?your|'
+        r'thank\s?you\s?for\s?(?:your\s?order|your\s?request)|request\s?received|'
+        r'booking\s?confirmed|order\s?(?:is\s?)?confirmed)'
+    ),
     "newsletter": re.compile(
         r'(?i)(weekly\s?digest|daily\s?roundup|newsletter'
         r'|read\s?more\s?articles?|top\s?stories|in\s?this\s?issue)'
@@ -78,6 +83,7 @@ SIGNAL_TO_CATEGORY: dict[str, dict[str, float]] = {
     "otp":             {"security": 0.70, "alerts": 0.50, "automated": 0.40},
     "action_required": {"urgent": 0.60, "important": 0.50, "action": 0.55},
     "social":          {"social": 0.70, "notifications": 0.40},
+    "confirmation":    {"orders": 0.80, "updates": 0.60, "automated": 0.50},
     "newsletter":      {"newsletter": 0.60, "marketing": 0.30},
     "login_alert":     {"security": 0.80, "alerts": 0.60, "automated": 0.40},
     "welcome":         {"onboarding": 0.75, "updates": 0.40, "automated": 0.30},
@@ -92,14 +98,14 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "marketing":     ["market", "promot", "advert", "deal", "offer", "sale", "discount", "promo"],
     "newsletter":    ["newsletter", "digest", "roundup", "weekly", "daily", "bulletin"],
     "finance":       ["financ", "payment", "bank", "transaction", "money", "bill", "invoice", "upi"],
-    "orders":        ["order", "ship", "deliver", "package", "track", "purchase", "cart"],
+    "orders":        ["order", "ship", "deliver", "package", "track", "purchase", "cart", "receipt"],
     "events":        ["event", "calendar", "meeting", "invit", "rsvp", "webinar", "conference"],
     "security":      ["secur", "otp", "verif", "auth", "password", "2fa", "login"],
     "alerts":        ["alert", "automat", "notif", "system", "warning"],
     "urgent":        ["urgent", "action", "deadline", "critical", "asap"],
     "important":     ["important", "priority", "flag", "starred"],
     "social":        ["social", "facebook", "twitter", "linkedin", "instagram", "follower"],
-    "updates":       ["update", "status", "change", "news", "progress"],
+    "updates":       ["update", "status", "change", "news", "progress", "confirm"],
     "promotions":    ["promot", "deal", "offer", "discount", "coupon", "sale", "clearance"],
     "notifications": ["notif", "ping", "mention", "activity"],
     "payments":      ["payment", "pay", "invoice", "receipt", "billing"],
